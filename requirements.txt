@@ -1,0 +1,11 @@
+neo4j
+qdrant-client
+tree-sitter
+tree-sitter-languages
+openai
+numpy
+sentence-transformers
+fastapi
+uvicorn
+gitpython
+python-dotenv
