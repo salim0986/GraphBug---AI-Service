@@ -94,3 +94,45 @@ class UniversalParser:
         except Exception as e:
             logger.warning(f"Parser error in {file_path}: {e}")
             return None, None
+    
+    def parse_code(self, code_bytes: bytes, lang_name: str):
+        """
+        Parse code from bytes (in-memory)
+        
+        Args:
+            code_bytes: Code content as bytes
+            lang_name: Language name (python, javascript, etc.)
+            
+        Returns:
+            (captures, code_bytes) or (None, None)
+        """
+        if not lang_name:
+            return None, None
+        
+        try:
+            # 1. Load Language & Parser
+            language = get_language(lang_name)
+            parser = get_parser(lang_name)
+            
+            # 2. Parse bytes
+            tree = parser.parse(code_bytes)
+            
+            # 3. Load Query
+            query_file = os.path.join(self.base_query_path, lang_name, "tags.scm")
+            
+            # Fallback: specific languages might not have tags.scm, skip them gracefully
+            if not os.path.exists(query_file):
+                return None, None
+            
+            with open(query_file, "r") as f:
+                query_scm = f.read()
+            
+            # 4. Execute Query
+            query = language.query(query_scm)
+            captures = query.captures(tree.root_node)
+            
+            return captures, code_bytes
+        
+        except Exception as e:
+            logger.warning(f"Parser error for {lang_name}: {e}")
+            return None, None

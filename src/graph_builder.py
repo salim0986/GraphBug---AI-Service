@@ -14,6 +14,7 @@ HYBRID_MAP = {
     "class_definition": "Class",        # Python
     "class_declaration": "Class",       # JS/TS/Java
     "interface_declaration": "Interface", # TS/Java
+    "internal_module": "Module",        # JS/TS (namespace/module declarations)
     "struct_item": "Struct",            # Rust
     "function_item": "Function",        # Rust
     "impl_item": "Class",               # Rust
@@ -200,3 +201,261 @@ class GraphBuilder:
                 logger.info(f"🗑️  Deleted graph nodes for repo {repo_id}")
         except Exception as e:
             logger.error(f"⚠️ Graph delete failed: {e}")
+    
+    def delete_file(self, file_uid: str):
+        """
+        Delete all entities for a specific file (for incremental updates)
+        
+        Args:
+            file_uid: File unique identifier (format: repo_id::file_path)
+        """
+        query = """
+        MATCH (f:File {uid: $file_uid})-[:DEFINES]->(e:Entity)
+        DETACH DELETE e, f
+        """
+        try:
+            with self.driver.session() as session:
+                session.run(query, file_uid=file_uid)
+                logger.debug(f"Deleted graph nodes for file {file_uid}")
+        except Exception as e:
+            logger.error(f"Graph file delete failed: {e}")
+    
+    # ========================================================================
+    # ADVANCED GRAPH QUERIES FOR CODE REVIEW (Phase 3.2)
+    # ========================================================================
+    
+    def find_related_by_file(self, repo_id: str, file_path: str, limit: int = 10):
+        """
+        Find all entities defined in a specific file
+        Returns functions, classes, and other entities
+        """
+        query = """
+        MATCH (e:Entity {repo_id: $repo_id, file: $file_path})
+        RETURN e.name AS name, e.type AS type, e.start_line AS line, 
+               e.end_line AS end_line, e.raw_code AS code
+        ORDER BY e.start_line
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, file_path=file_path, limit=limit)
+                return [
+                    {
+                        "name": record["name"],
+                        "type": record["type"],
+                        "line": record["line"],
+                        "end_line": record["end_line"],
+                        "code": record["code"]
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding entities by file: {e}")
+            return []
+    
+    def find_callers(self, repo_id: str, function_name: str, limit: int = 10):
+        """
+        Find all functions that call a specific function (reverse dependency)
+        Useful for impact analysis
+        """
+        query = """
+        MATCH (caller:Entity {repo_id: $repo_id})-[:MAY_CALL]->(target:Entity {repo_id: $repo_id, name: $function_name})
+        RETURN caller.name AS name, caller.file AS file, caller.type AS type, 
+               caller.start_line AS line
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, function_name=function_name, limit=limit)
+                return [
+                    {
+                        "name": record["name"],
+                        "file": record["file"],
+                        "type": record["type"],
+                        "line": record["line"],
+                        "relationship": "calls"
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding callers: {e}")
+            return []
+    
+    def find_call_chain(self, repo_id: str, function_name: str, max_depth: int = 3):
+        """
+        Find the call chain for a function (what it calls, recursively)
+        Useful for understanding execution flow
+        """
+        query = """
+        MATCH path = (source:Entity {repo_id: $repo_id, name: $function_name})-[:MAY_CALL*1..$max_depth]->(target)
+        WITH path, length(path) AS depth
+        ORDER BY depth
+        RETURN [node IN nodes(path) | {
+            name: node.name, 
+            type: node.type, 
+            file: node.file, 
+            line: node.start_line
+        }] AS chain
+        LIMIT 10
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, function_name=function_name, max_depth=max_depth)
+                return [record["chain"] for record in result]
+        except Exception as e:
+            logger.error(f"Error finding call chain: {e}")
+            return []
+    
+    def find_file_dependencies(self, repo_id: str, file_path: str):
+        """
+        Find all files that this file depends on (via function calls)
+        Useful for understanding file-level coupling
+        """
+        query = """
+        MATCH (source:Entity {repo_id: $repo_id, file: $file_path})-[:MAY_CALL]->(target:Entity {repo_id: $repo_id})
+        WHERE target.file <> $file_path
+        RETURN DISTINCT target.file AS file, COUNT(*) AS call_count
+        ORDER BY call_count DESC
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, file_path=file_path)
+                return [
+                    {
+                        "file": record["file"],
+                        "call_count": record["call_count"],
+                        "relationship": "depends_on"
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding file dependencies: {e}")
+            return []
+    
+    def find_similar_functions(self, repo_id: str, function_name: str, limit: int = 5):
+        """
+        Find functions with similar names (potential duplicates or related functionality)
+        Uses fuzzy name matching
+        """
+        query = """
+        MATCH (e:Entity {repo_id: $repo_id, type: 'Function'})
+        WHERE e.name CONTAINS $search_term OR $search_term CONTAINS e.name
+        AND e.name <> $function_name
+        RETURN e.name AS name, e.file AS file, e.start_line AS line, e.raw_code AS code
+        LIMIT $limit
+        """
+        # Extract base name (remove prefixes/suffixes for better matching)
+        search_term = function_name.replace("get", "").replace("set", "").replace("_", "")
+        
+        try:
+            with self.driver.session() as session:
+                result = session.run(
+                    query, 
+                    repo_id=repo_id, 
+                    function_name=function_name,
+                    search_term=search_term,
+                    limit=limit
+                )
+                return [
+                    {
+                        "name": record["name"],
+                        "file": record["file"],
+                        "line": record["line"],
+                        "code": record["code"]
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding similar functions: {e}")
+            return []
+    
+    def get_complexity_hotspots(self, repo_id: str, min_calls: int = 5, limit: int = 10):
+        """
+        Find functions with high number of outgoing calls (complexity hotspots)
+        These functions are doing too much and may need refactoring
+        """
+        query = """
+        MATCH (source:Entity {repo_id: $repo_id})-[:MAY_CALL]->(target)
+        WITH source, COUNT(target) AS call_count
+        WHERE call_count >= $min_calls
+        RETURN source.name AS name, source.file AS file, source.type AS type,
+               source.start_line AS line, call_count
+        ORDER BY call_count DESC
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, min_calls=min_calls, limit=limit)
+                return [
+                    {
+                        "name": record["name"],
+                        "file": record["file"],
+                        "type": record["type"],
+                        "line": record["line"],
+                        "call_count": record["call_count"],
+                        "issue": "High complexity - too many dependencies"
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding complexity hotspots: {e}")
+            return []
+    
+    def get_highly_coupled_files(self, repo_id: str, min_connections: int = 5, limit: int = 10):
+        """
+        Find files that are highly coupled (many cross-file dependencies)
+        Useful for identifying architectural issues
+        """
+        query = """
+        MATCH (source:Entity {repo_id: $repo_id})-[:MAY_CALL]->(target:Entity {repo_id: $repo_id})
+        WHERE source.file <> target.file
+        WITH source.file AS source_file, target.file AS target_file, COUNT(*) AS connections
+        WHERE connections >= $min_connections
+        RETURN source_file, target_file, connections
+        ORDER BY connections DESC
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, min_connections=min_connections, limit=limit)
+                return [
+                    {
+                        "source_file": record["source_file"],
+                        "target_file": record["target_file"],
+                        "connections": record["connections"],
+                        "issue": "High coupling between files"
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding coupled files: {e}")
+            return []
+    
+    def find_unused_functions(self, repo_id: str, limit: int = 20):
+        """
+        Find functions that are never called by other code
+        Potential dead code candidates
+        """
+        query = """
+        MATCH (e:Entity {repo_id: $repo_id, type: 'Function'})
+        WHERE NOT (()-[:MAY_CALL]->(e))
+        AND NOT e.name IN ['main', 'index', '__init__', 'handler', 'default']
+        RETURN e.name AS name, e.file AS file, e.start_line AS line
+        ORDER BY e.file, e.start_line
+        LIMIT $limit
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, limit=limit)
+                return [
+                    {
+                        "name": record["name"],
+                        "file": record["file"],
+                        "line": record["line"],
+                        "issue": "Potentially unused function (no callers found)"
+                    }
+                    for record in result
+                ]
+        except Exception as e:
+            logger.error(f"Error finding unused functions: {e}")
+            return []

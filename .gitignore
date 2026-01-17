@@ -14,8 +14,10 @@ ENV/
 dist/
 build/
 
-# Data
-data/
+# Data stores (Neo4j and Qdrant)
+data/neo4j/
+data/qdrant/
+data/dbms/
 temp_repos/
 
 # IDE
