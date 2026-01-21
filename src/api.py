@@ -1,5 +1,6 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from .parser import UniversalParser, EXTENSION_MAP
 from .graph_builder import GraphBuilder
@@ -18,13 +19,41 @@ from .logger import setup_logger
 from .incremental_ingest import ingest_repo_incremental
 from sentence_transformers import SentenceTransformer
 from .github_client import GitHubClient, GitHubConfig
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from .security_utils import (
+    safe_join,
+    sanitize_repo_id,
+    sanitize_owner_repo,
+    sanitize_file_path,
+    sanitize_error_message,
+    validate_request_size
+)
 import git
 import shutil
 import os
 import asyncio
 
+# Initialize rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(title="Graph Bug AI Service", version="2.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 logger = setup_logger(__name__)
+
+# Configure CORS
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+    max_age=3600
+)
 
 @app.on_event("startup")
 async def startup_event():
@@ -81,21 +110,33 @@ review_workflow = create_review_workflow(
 # --- MODELS ---
 
 class RepoRequest(BaseModel):
-    repo_url: str
-    repo_id: str
-    installation_id: str
+    repo_url: str = Field(..., max_length=500, pattern=r'^https://github\.com/[\w-]+/[\w.-]+(.git)?$')
+    repo_id: str = Field(..., min_length=1, max_length=200, pattern=r'^[a-zA-Z0-9_-]+$')
+    installation_id: str = Field(..., pattern=r'^\d+$', max_length=20)
     incremental: Optional[bool] = False  # Enable incremental ingestion
-    last_commit: Optional[str] = None  # Previous commit SHA for incremental
+    last_commit: Optional[str] = Field(None, min_length=7, max_length=40, pattern=r'^[a-fA-F0-9]+$')  # Previous commit SHA for incremental
 
 class QueryRequest(BaseModel):
-    repo_id: str
-    query: str
+    repo_id: str = Field(..., min_length=1, max_length=200, pattern=r'^[a-zA-Z0-9_-]+$')
+    query: str = Field(..., min_length=1, max_length=1000)
 
 def process_repo_task(req: RepoRequest):
     """The Heavy Worker Function: Clones -> Parses -> Indexes"""
     logger.info(f"Starting processing for {req.repo_url} (ID: {req.repo_id})")
     
-    local_path = f"./temp_repos/{req.repo_id}"
+    # Sanitize repo_id to prevent path traversal
+    try:
+        safe_repo_id = sanitize_repo_id(req.repo_id)
+    except ValueError as e:
+        logger.error(f"Invalid repo_id: {e}")
+        return
+    
+    # Use safe_join to prevent directory traversal
+    try:
+        local_path = safe_join("./temp_repos", safe_repo_id)
+    except ValueError as e:
+        logger.error(f"Path traversal attempt detected: {e}")
+        return
     
     # 1. Clean & Clone
     if os.path.exists(local_path):
@@ -211,7 +252,7 @@ def process_repo_task(req: RepoRequest):
 # --- ENDPOINTS ---
 
 @app.post("/ingest")
-async def ingest_repo(req: RepoRequest, background_tasks: BackgroundTasks):
+async def ingest_repo(request: Request, req: RepoRequest, background_tasks: BackgroundTasks):
     """
     Ingest repository with optional incremental mode
     
@@ -297,7 +338,7 @@ async def ingest_repo_legacy(req: RepoRequest, background_tasks: BackgroundTasks
     return {"status": "queued", "repo_id": req.repo_id}
 
 @app.post("/query")
-async def search_repo(req: QueryRequest):
+async def search_repo(http_request: Request, req: QueryRequest):
     """
     GraphRAG Search:
     1. Vector Search finds the relevant 'entry points'.
@@ -437,13 +478,14 @@ class PRReviewWebhookRequest(BaseModel):
     installation_id: str
     pull_request_id: str
     context: Any  # Flexible type for PR context from frontend
+    gemini_api_key: Optional[str] = None  # User's Gemini API key (BYO system)
     
     class Config:
         extra = "allow"  # Allow extra fields
 
 
 @app.post("/review")
-async def process_pr_review_webhook(request: PRReviewWebhookRequest, background_tasks: BackgroundTasks):
+async def process_pr_review_webhook(http_request: Request, request: PRReviewWebhookRequest, background_tasks: BackgroundTasks):
     """
     Main webhook endpoint for PR review processing
     
@@ -499,7 +541,8 @@ async def process_pr_review_webhook(request: PRReviewWebhookRequest, background_
             installation_id=request.installation_id,
             pull_request_db_id=request.pull_request_id,
             owner=request.owner,
-            repo=request.repo
+            repo=request.repo,
+            gemini_api_key=request.gemini_api_key
         )
         
         # Return immediately with queued status
@@ -679,7 +722,8 @@ async def execute_review_task(
     installation_id: str,
     pull_request_db_id: str,
     owner: str,
-    repo: str
+    repo: str,
+    gemini_api_key: Optional[str] = None
 ):
     """
     Background task that executes the complete review workflow
@@ -692,8 +736,21 @@ async def execute_review_task(
     try:
         logger.info(f"🚀 Starting review workflow for PR #{pr_number} in {repo_id}")
         
+        # Create user-specific workflow with their Gemini API key
+        if gemini_api_key:
+            from .gemini_client import create_gemini_client
+            user_gemini_client = create_gemini_client(api_key=gemini_api_key)
+            user_workflow = create_review_workflow(
+                context_builder=context_builder,
+                gemini_client=user_gemini_client
+            )
+            logger.info("✅ Using user's Gemini API key for review")
+        else:
+            user_workflow = review_workflow
+            logger.info("⚠️ Using default Gemini API key (fallback)")
+        
         # Execute the LangGraph workflow
-        final_state = await review_workflow.run_review(
+        final_state = await user_workflow.run_review(
             pr_number=pr_number,
             repo_id=repo_id,
             pr_title=pr_title,
@@ -791,7 +848,7 @@ class RepositoryStatsResponse(BaseModel):
 
 
 @app.post("/search/semantic")
-async def semantic_search(request: SemanticSearchRequest):
+async def semantic_search(http_request: Request, request: SemanticSearchRequest):
     """
     Natural language code search
     
@@ -816,7 +873,7 @@ async def semantic_search(request: SemanticSearchRequest):
 
 
 @app.post("/search/similar")
-async def find_similar_code(request: SimilarCodeRequest):
+async def find_similar_code(http_request: Request, request: SimilarCodeRequest):
     """
     Find code similar to a given snippet
     
@@ -842,7 +899,7 @@ async def find_similar_code(request: SimilarCodeRequest):
 
 
 @app.post("/search/duplicates")
-async def find_duplicates(request: SimilarCodeRequest):
+async def find_duplicates(http_request: Request, request: SimilarCodeRequest):
     """
     Find duplicate code (high similarity threshold: 90%+)
     
@@ -988,7 +1045,7 @@ class WorkflowRequest(BaseModel):
 
 
 @app.post("/workflow/review")
-async def execute_review_workflow(request: WorkflowRequest):
+async def execute_review_workflow(http_request: Request, request: WorkflowRequest):
     """
     Execute the complete LangGraph review workflow
     
