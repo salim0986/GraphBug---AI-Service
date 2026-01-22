@@ -1,3 +1,14 @@
+---
+title: Graph Bug AI Service
+emoji: 🐛
+colorFrom: blue
+colorTo: purple
+sdk: docker
+app_port: 7860
+pinned: false
+license: mit
+---
+
 # Graph Bug AI Service
 
 AI-powered code intelligence service that builds knowledge graphs and semantic search for GitHub repositories.
