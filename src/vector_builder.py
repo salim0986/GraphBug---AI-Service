@@ -2,13 +2,27 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, VectorParams, Distance
 from qdrant_client.http import models
 import uuid
+from typing import Optional
 from .logger import setup_logger
 
 logger = setup_logger(__name__)
 
 class VectorBuilder:
-    def __init__(self, url, model):
-        self.client = QdrantClient(url=url)
+    def __init__(self, url, model, api_key: Optional[str] = None):
+        """
+        Initialize VectorBuilder with optional API key for Qdrant Cloud.
+        
+        Args:
+            url: Qdrant server URL
+            model: Embedding model
+            api_key: Optional API key for Qdrant Cloud authentication
+        """
+        if api_key:
+            self.client = QdrantClient(url=url, api_key=api_key)
+            logger.info("Initialized Qdrant client with API key authentication")
+        else:
+            self.client = QdrantClient(url=url)
+            logger.info("Initialized Qdrant client without authentication")
         self.model = model
         self.embed_model = model  # Expose for batch operations
         self.collection = "repo_code"

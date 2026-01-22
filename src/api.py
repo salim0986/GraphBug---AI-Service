@@ -76,9 +76,13 @@ IGNORE_DIRS = {
 # Initialize Singletons
 parser = UniversalParser()
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
-# FIX: Use localhost for local execution
-graph_db = GraphBuilder("neo4j://localhost:7687", ("neo4j", "graphbug123"))
-vector_db = VectorBuilder("http://localhost:6333", embed_model)
+
+# Load config
+from .config import NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, QDRANT_URL, QDRANT_API_KEY
+
+# Initialize databases with config
+graph_db = GraphBuilder(NEO4J_URI, (NEO4J_USER, NEO4J_PASSWORD))
+vector_db = VectorBuilder(QDRANT_URL, embed_model, api_key=QDRANT_API_KEY)
 
 # Initialize Code Analyzer and Context Builder
 code_analyzer = CodeAnalyzer(graph_db, vector_db, parser)

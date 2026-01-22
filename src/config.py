@@ -17,6 +17,7 @@ NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "graphbug123")
 
 # Qdrant Configuration
 QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")  # Optional, for Qdrant Cloud
 
 # Embedding Model
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
