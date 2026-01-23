@@ -1,5 +1,6 @@
 import os
 from tree_sitter_languages import get_language, get_parser
+import tree_sitter
 from .logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -83,7 +84,8 @@ class UniversalParser:
                 query_scm = f.read()
 
             # 4. Execute Query
-            query = language.query(query_scm)
+            # tree_sitter.Query expects (language, source) not language.query(source)
+            query = tree_sitter.Query(language, query_scm)
             captures = query.captures(tree.root_node)
             
             return captures, code_bytes
@@ -128,7 +130,8 @@ class UniversalParser:
                 query_scm = f.read()
             
             # 4. Execute Query
-            query = language.query(query_scm)
+            # tree_sitter.Query expects (language, source) not language.query(source)
+            query = tree_sitter.Query(language, query_scm)
             captures = query.captures(tree.root_node)
             
             return captures, code_bytes
