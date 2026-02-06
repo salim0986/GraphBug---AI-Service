@@ -120,6 +120,11 @@ class TemporaryGraphBuilder:
         # Create file node
         file_node = TempFileNode(path=filename, language=language)
         
+        # Skip invalid/unsupported languages
+        if not language or language == "text":
+            logger.warning(f"[TempGraph] Invalid language '{language}' for {filename}, skipping")
+            return file_node
+        
         try:
             # Parse with tree-sitter
             content_bytes = content.encode('utf-8')

@@ -46,8 +46,70 @@ HYBRID_MAP = {
 }
 
 class GraphBuilder:
-    def __init__(self, uri, auth):
-        self.driver = GraphDatabase.driver(uri, auth=auth)
+    def __init__(self, uri, auth, max_retries=3, retry_delay=2.0):
+        """Initialize GraphBuilder with connection retry logic
+        
+        Args:
+            uri: Neo4j connection URI
+            auth: (username, password) tuple
+            max_retries: Maximum connection retry attempts
+            retry_delay: Initial delay between retries (exponential backoff)
+        """
+        self.uri = uri
+        self.auth = auth
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self.driver = self._connect_with_retry()
+    
+    def _connect_with_retry(self):
+        """Connect to Neo4j with exponential backoff retry"""
+        import time
+        
+        for attempt in range(self.max_retries):
+            try:
+                logger.info(f"Connecting to Neo4j at {self.uri} (attempt {attempt + 1}/{self.max_retries})")
+                driver = GraphDatabase.driver(self.uri, auth=self.auth)
+                
+                # Verify connectivity
+                with driver.session() as session:
+                    session.run("RETURN 1")
+                
+                logger.info(f"✅ Neo4j connection established successfully")
+                
+                # Create indexes for performance
+                self._ensure_indexes(driver)
+                
+                return driver
+                
+            except Exception as e:
+                logger.warning(f"Neo4j connection attempt {attempt + 1} failed: {e}")
+                
+                if attempt < self.max_retries - 1:
+                    wait_time = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                    logger.info(f"Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"❌ Failed to connect to Neo4j after {self.max_retries} attempts")
+                    logger.error(f"   URI: {self.uri}")
+                    logger.error(f"   Error: {e}")
+                    raise ConnectionError(f"Cannot connect to Neo4j: {e}")
+    
+    def _ensure_indexes(self, driver):
+        """Create Neo4j indexes for performance on large repositories"""
+        indexes = [
+            "CREATE INDEX entity_repo_id IF NOT EXISTS FOR (e:Entity) ON (e.repo_id)",
+            "CREATE INDEX entity_uid IF NOT EXISTS FOR (e:Entity) ON (e.uid)",
+            "CREATE INDEX file_repo_id IF NOT EXISTS FOR (f:File) ON (f.repo_id)",
+            "CREATE INDEX file_uid IF NOT EXISTS FOR (f:File) ON (f.uid)",
+        ]
+        
+        try:
+            with driver.session() as session:
+                for index_query in indexes:
+                    session.run(index_query)
+                logger.info("✓ Neo4j indexes ensured")
+        except Exception as e:
+            logger.warning(f"Index creation warning (may already exist): {e}")
 
     def process_file_nodes(self, repo_id, file_path, captures, code_bytes):
         nodes_to_create = []
@@ -197,10 +259,25 @@ class GraphBuilder:
         query = "MATCH (n {repo_id: $repo_id}) DETACH DELETE n"
         try:
             with self.driver.session() as session:
-                session.run(query, repo_id=repo_id)
-                logger.info(f"🗑️  Deleted graph nodes for repo {repo_id}")
+                result = session.run(query, repo_id=repo_id)
+                summary = result.consume()
+                deleted_count = summary.counters.nodes_deleted
+                logger.info(f"🗑️  Deleted {deleted_count} graph nodes for repo {repo_id}")
+                return deleted_count
         except Exception as e:
             logger.error(f"⚠️ Graph delete failed: {e}")
+            return 0
+    
+    def get_repo_node_count(self, repo_id: str) -> int:
+        """Get count of nodes for a given repo_id."""
+        try:
+            with self.driver.session() as session:
+                result = session.run("MATCH (n {repo_id: $repo_id}) RETURN count(n) as count", repo_id=repo_id)
+                record = result.single()
+                return record["count"] if record else 0
+        except Exception as e:
+            logger.error(f"Error counting nodes: {e}")
+            return 0
     
     def delete_file(self, file_uid: str):
         """
@@ -229,6 +306,8 @@ class GraphBuilder:
         Find all entities defined in a specific file
         Returns functions, classes, and other entities
         """
+        logger.debug(f"[GraphDB] find_related_by_file: repo_id={repo_id}, file={file_path}, limit={limit}")
+        
         query = """
         MATCH (e:Entity {repo_id: $repo_id, file: $file_path})
         RETURN e.name AS name, e.type AS type, e.start_line AS line, 
@@ -239,7 +318,7 @@ class GraphBuilder:
         try:
             with self.driver.session() as session:
                 result = session.run(query, repo_id=repo_id, file_path=file_path, limit=limit)
-                return [
+                entities = [
                     {
                         "name": record["name"],
                         "type": record["type"],
@@ -249,6 +328,10 @@ class GraphBuilder:
                     }
                     for record in result
                 ]
+                logger.debug(f"[GraphDB] find_related_by_file returned {len(entities)} entities")
+                if len(entities) == 0:
+                    logger.warning(f"[GraphDB] No entities found for repo_id={repo_id}, file={file_path}")
+                return entities
         except Exception as e:
             logger.error(f"Error finding entities by file: {e}")
             return []
@@ -311,6 +394,8 @@ class GraphBuilder:
         Find all files that this file depends on (via function calls)
         Useful for understanding file-level coupling
         """
+        logger.debug(f"[GraphDB] find_file_dependencies: repo_id={repo_id}, file={file_path}")
+        
         query = """
         MATCH (source:Entity {repo_id: $repo_id, file: $file_path})-[:MAY_CALL]->(target:Entity {repo_id: $repo_id})
         WHERE target.file <> $file_path
@@ -320,7 +405,7 @@ class GraphBuilder:
         try:
             with self.driver.session() as session:
                 result = session.run(query, repo_id=repo_id, file_path=file_path)
-                return [
+                dependencies = [
                     {
                         "file": record["file"],
                         "call_count": record["call_count"],
@@ -328,6 +413,8 @@ class GraphBuilder:
                     }
                     for record in result
                 ]
+                logger.debug(f"[GraphDB] find_file_dependencies returned {len(dependencies)} dependencies")
+                return dependencies
         except Exception as e:
             logger.error(f"Error finding file dependencies: {e}")
             return []

@@ -30,6 +30,7 @@ class VectorBuilder:
     def ensure_collection(self):
         """
         Creates the collection if it doesn't exist.
+        Also creates payload index for repo_id filtering.
         """
         try:
             if not self.client.collection_exists(self.collection):
@@ -38,6 +39,29 @@ class VectorBuilder:
                     vectors_config=VectorParams(size=384, distance=Distance.COSINE),
                 )
                 logger.info(f"Created vector collection '{self.collection}'")
+                
+                # Create payload index for repo_id filtering
+                # This is CRITICAL for delete_repo() and tenant isolation
+                self.client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name="repo_id",
+                    field_schema="keyword"  # Exact match for string filtering
+                )
+                logger.info(f"✅ Created payload index for 'repo_id' field")
+            else:
+                # Collection exists, ensure index exists
+                try:
+                    collection_info = self.client.get_collection(self.collection)
+                    # Check if index exists, if not create it
+                    self.client.create_payload_index(
+                        collection_name=self.collection,
+                        field_name="repo_id",
+                        field_schema="keyword"
+                    )
+                    logger.info(f"✅ Ensured payload index for 'repo_id' field")
+                except Exception as index_error:
+                    # Index might already exist, that's okay
+                    logger.debug(f"Payload index check: {index_error}")
         except Exception as e:
             logger.error(f"Vector DB connection error: {e}")
             raise
@@ -107,6 +131,8 @@ class VectorBuilder:
         """
         Retrieves code relevant to the query, strictly filtered by repo_id.
         """
+        logger.debug(f"[VectorDB] search_similar: repo_id={repo_id}, query='{query_text[:50]}...', limit={limit}")
+        
         try:
             query_vector = self.model.encode(query_text).tolist()
             
@@ -123,6 +149,11 @@ class VectorBuilder:
                 ),
                 limit=limit
             ).points
+            
+            logger.debug(f"[VectorDB] search_similar returned {len(result)} results")
+            if len(result) == 0:
+                logger.warning(f"[VectorDB] No vectors found for repo_id={repo_id}, query='{query_text[:50]}'")
+            
             return result
         except Exception as e:
             logger.error(f"Vector search error: {e}")

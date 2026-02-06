@@ -74,28 +74,101 @@ Provide thorough, actionable code reviews with context-aware insights.
 7. ✅ Testing coverage recommendations
 """
     
-    QUICK_REVIEW_PROMPT = """## Quick Review Request
+    QUICK_REVIEW_PROMPT = """## Quick Scan: {pr_title}
 
-Perform a focused code review of this small PR.
+**Scope:** {total_files} files | +{additions}/-{deletions}
 
-**PR Title:** {pr_title}
-**Files Changed:** {total_files}
-**Lines Changed:** +{additions} -{deletions}
+**GraphRAG:** Entities: {entities} | Dependencies: {dependencies} | Similar: {similar_code}
 
-{description}
+**Files:** {files_summary}
+**Issues:** {issues_summary}
 
-**Changed Files:**
-{files_summary}
+---
 
-**Key Issues Found:**
-{issues_summary}
+## Find Problems Only
 
-Provide a concise review covering:
-1. Critical issues (if any)
-2. Code quality observations
-3. Quick recommendations
+Identify actual mistakes:
+🔴 Critical (security, crashes)
+🟠 High (bugs, logic errors)
+🟡 Medium (code smells)
 
-Keep it brief but actionable.
+Cite line numbers (L45+). Reference GraphRAG if data provided (not "None"). No generic advice.
+
+**Output:**
+### Issues
+[List or "✅ None"]
+
+### GraphRAG Matches  
+[Cite 1-2 if available]
+"""
+    
+    QUICK_SCAN_PROMPT = """## 🔎 PHASE 3: Quick Security & Critical Issue Scan
+
+**Purpose:** Fast scan to identify CRITICAL issues and security vulnerabilities ONLY.
+
+**File:** {filename}
+**Language:** {language}
+**Changes:** +{additions} -{deletions}
+
+**Diff with Line Numbers:**
+```
+{diff}
+```
+
+## 🎯 YOUR TASK: Scan for CRITICAL Issues ONLY
+
+**Focus Areas (in priority order):**
+
+1. **🔒 Security Vulnerabilities**
+   - SQL injection
+   - XSS vulnerabilities
+   - Authentication/authorization bypasses
+   - Credential exposure
+   - Insecure deserialization
+
+2. **💥 Critical Bugs**
+   - Null pointer/undefined access
+   - Resource leaks (memory, connections, files)
+   - Race conditions
+   - Data corruption risks
+
+3. **🚫 Immediate Blockers**
+   - Breaking API changes without migration
+   - Data loss scenarios
+   - Production outage risks
+
+## ⌛ SPEED REQUIREMENTS:
+- This is a QUICK scan - complete in <5 seconds
+- Skip non-critical issues (quality, style, minor optimizations)
+- Only flag issues that are:
+  - **Urgent** (must fix before merge)
+  - **High impact** (security, data integrity, availability)
+  - **Well-founded** (not hypothetical)
+
+## 📝 OUTPUT FORMAT:
+
+If critical issues found:
+```
+🔴 **CRITICAL ISSUES DETECTED**
+
+🔴 **L<line>+/-**: <Brief issue title>
+- **Problem:** <What's wrong with evidence from diff>
+- **Impact:** <Why this is critical>
+- **Fix:** <Quick suggestion>
+```
+
+If NO critical issues:
+```
+✅ **No critical issues detected in quick scan**
+
+Proceed to detailed review for code quality, performance, and best practices.
+```
+
+**IMPORTANT:**
+- Cite line numbers using L<num>+/- format from the diff
+- Be specific - reference actual code from the diff
+- Don't flag minor issues or style problems
+- If unsure whether issue is critical, skip it (detailed review will catch it)
 """
     
     STANDARD_REVIEW_PROMPT = """## Standard Code Review Request
@@ -138,112 +211,226 @@ Provide a comprehensive review including:
 Be specific and reference line numbers where applicable.
 """
     
-    DEEP_REVIEW_PROMPT = """## Deep Code Review Request
+    DEEP_REVIEW_PROMPT = """## Issue-Focused Code Review with GraphRAG Context
 
-This is a complex, high-risk PR requiring thorough analysis.
+**PR:** {pr_title}
+**Scope:** {total_files} files | +{additions}/-{deletions} | Risk: {risk_level}
 
-**PR Title:** {pr_title}
-**Description:** {description}
+---
 
-**Complexity Metrics:**
-- Total Files: {total_files}
-- Code Changes: +{additions} -{deletions}
-- Languages: {languages}
-- Risk Level: **{risk_level}**
-- Cyclomatic Complexity: High
+## Context from GraphRAG Analysis
 
-**Critical Concerns:**
-{critical_issues}
-
-**High Priority Issues:**
-{high_issues}
-
-**Architecture Impact:**
-- Affected Components: {affected_callers} functions
-- Complexity Hotspots: {complexity_hotspots}
-- Coupling Issues: {coupling_files}
-
-**Similar Code Patterns:**
+### 🔗 Similar Code Patterns in Codebase
 {similar_code}
 
-**File-by-File Analysis Required:**
-{files_details}
-
-Perform an in-depth review including:
-1. **Security Deep Dive** - Analyze all security implications
-2. **Architecture Review** - Assess design decisions and patterns
-3. **Performance Analysis** - Identify bottlenecks and inefficiencies
-4. **Maintainability** - Evaluate long-term code health
-5. **Testing Strategy** - Recommend comprehensive test coverage
-6. **Risk Assessment** - Identify potential production issues
-7. **Migration Path** - If breaking changes, suggest migration
-8. **Documentation** - Assess documentation needs
-
-Be extremely thorough. This PR requires careful scrutiny.
-"""
-    
-    FILE_REVIEW_PROMPT = """## Review Individual File
-
-**File:** {filename}
-**Language:** {language}
-**Changes:** +{additions} -{deletions}
-
-**Static Analysis Issues Detected:**
-{issues}
-
-**🔍 Similar Code Patterns:**
-{similar_code}
-
-**📊 File Dependencies:**
+### 📦 Dependencies & Impact
 {dependencies}
 
-**Code Diff:**
+### 🏗️ Key Entities & Relationships
+{entities}
+
+### 🐛 Static Analysis Pre-Scan
+- Critical Issues: {critical_issues}
+- High Priority Issues: {high_issues}
+
+---
+
+## Files Changed (with code snippets)
+
+{files_details}
+
+---
+
+## YOUR TASK: Find Issues with Evidence
+
+You are a senior code reviewer. For EACH issue you find:
+
+1. **Cite the line number**: `L45+` (added), `L67-` (removed)
+2. **Show the problematic code**: Include the actual code snippet
+3. **Explain the issue**: What's wrong and why it matters
+4. **Reference GraphRAG**: If similar patterns exist in the codebase, cite them with code
+5. **Suggest a fix**: Show how to fix it (code example when possible)
+
+**CRITICAL**: You MUST include actual code snippets in your review. Do not just cite line numbers.
+
+---
+
+## Required Output Format
+
+### 🔴 CRITICAL
+[If found:]
+
+**L<line>+**: <Issue title>
+
+**Code:**
+```
+<actual problematic code from the diff>
+```
+
+**Issue**: <Detailed explanation of the problem>
+
+**Evidence**: <GraphRAG reference with similar code if applicable>
+
+**Fix**: <How to fix it, with code example if possible>
+
+---
+
+### 🟠 HIGH  
+[Same format as above]
+
+### 🟡 MEDIUM
+[Same format as above]
+
+### ✅ No Issues Found
+[If no issues in a category, state "None - code looks good"]
+
+---
+
+## GraphRAG Requirement
+
+If similar code, dependencies, or entities are provided above (not "None"), you MUST cite at least 3-5 in your findings with actual code comparisons.
+
+**Example of GOOD usage:**
+
+❌ **BAD**: "SQL injection at L45"
+
+✅ **GOOD**: 
+"**L45+**: SQL injection vulnerability
+
+**Code:**
+```python
+query = "SELECT * FROM users WHERE id=" + user_input
+```
+
+**Issue**: Direct string concatenation enables SQL injection attacks
+
+**Evidence**: Similar vulnerable pattern in auth.py:L234 (GraphRAG similarity: 0.89):
+```python
+query = f"SELECT * FROM sessions WHERE token={{user_token}}"
+```
+Both use unsafe string operations instead of parameterized queries.
+
+**Fix**:
+```python
+query = "SELECT * FROM users WHERE id=?"
+db.execute(query, [user_input])
+```"
+
+---
+
+**Focus**: Find bugs, security issues, and mistakes. Include code context for EVERY issue.
+"""
+    
+    FILE_REVIEW_PROMPT = """## File Review: {filename}
+
+**Changes:** +{additions}/-{deletions} | **Language:** {language}
+
+---
+
+## Code Diff (with line numbers)
+
 ```{language}
 {diff}
 ```
 
-**Review Instructions:**
-Leverage the context above (similar code and dependencies) to provide context-aware feedback.
+---
 
-Provide detailed feedback on:
-1. **Issues and How to Fix Them** - Reference specific line numbers and provide code examples
-2. **Code Quality Improvements** - Based on similar patterns found in the codebase
-3. **Best Practices** - For this {language} language
-4. **Architectural Insights** - Considering the dependencies and coupling shown above
-5. **Refactoring Opportunities** - Suggest consolidation if similar code is found
+## GraphRAG Context for This File
 
-Format your response with:
-- Clear section headers (##)
-- Severity badges for issues (🔴 Critical, 🟠 High, 🟡 Medium, 🟢 Low)
-- Code examples in ```{language} blocks
-- Specific line references
+### Similar Code in Codebase
+{similar_code}
+
+### Dependencies & Impact
+{dependencies}
+
+### Related Entities
+{entities}
+
+### Pre-Scan Issues Found
+{issues}
+
+---
+
+## Find Issues with Code Context
+
+Review ONLY the changes shown above. For EACH issue:
+
+1. **Cite line number**: `L45+` or `L67-`
+2. **Show the code**: Include the actual code snippet
+3. **Explain the problem**: What's wrong and why
+4. **Reference GraphRAG**: Cite similar patterns with code if available
+5. **Suggest fix**: Provide code example when possible
+
+**CRITICAL**: Include actual code snippets, not just line numbers.
+
+---
+
+## Required Format
+
+### CRITICAL
+[If found:]
+
+**L<line>+**: <Issue title>
+
+**Code:**
+```{language}
+<actual code>
+```
+
+**Issue**: <Explanation>
+**Evidence**: <GraphRAG reference with code if applicable>
+**Fix**: <Solution with code>
+
+---
+
+### HIGH
+[Same format]
+
+### MEDIUM
+[Same format]
+
+### No Issues Found
+[If clean: "No issues found - code looks good"]
+
+---
+
+**GraphRAG Usage**: If similar code/dependencies are provided (not "None"), cite them with actual code comparisons.
 """
     
-    AGGREGATION_PROMPT = """## Aggregate Review Results
+    AGGREGATION_PROMPT = """## Summary Review
 
-Synthesize multiple file reviews into a cohesive overall review.
+**PR:** {pr_title}
+**Files:** {files_count} | **Total Issues:** {total_issues}
 
-**PR Summary:**
-- Title: {pr_title}
-- Files Reviewed: {files_count}
-- Total Issues: {total_issues}
+**Breakdown:**
+\ud83d\udd34 Critical: {critical_count}
+\ud83d\udfe0 High: {high_count}
+\ud83d\udfe1 Medium: {medium_count}
 
-**Individual File Reviews:**
+**Individual Reviews:**
 {file_reviews}
 
-**Overall Metrics:**
-- Critical Issues: {critical_count}
-- High Issues: {high_count}  
-- Medium Issues: {medium_count}
+---
 
-Create a unified review that:
-1. Summarizes key findings across all files
-2. Prioritizes the most important issues
-3. Identifies patterns and themes
-4. Provides actionable recommendations
-5. Gives an overall assessment (Approve / Request Changes / Comment)
+## Create Brief Summary
 
-Format as a clear, well-structured PR review comment.
+Group by severity. Preserve GraphRAG insights from individual reviews (dependencies, similar code).
+
+**Output:**
+
+### \ud83d\udd34 Critical Issues Summary
+[List key issues across files or "None"]
+
+### \ud83d\udfe0 High Priority Summary
+[List or "None"]
+
+### \ud83d\udfe1 Medium Priority Summary
+[List or "None"]
+
+### Overall Assessment
+[Approve / Request Changes / Comment with brief rationale]
+
+Format as a clear, well-structured PR review comment. DO NOT discard GraphRAG context.
 """
 
 

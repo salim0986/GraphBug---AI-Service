@@ -45,6 +45,19 @@ EXTENSION_MAP = {
     ".md": "markdown"
 }
 
+def detect_language_from_filename(filename: str) -> str:
+    """
+    Detect programming language from filename extension
+    
+    Args:
+        filename: File path or name
+        
+    Returns:
+        Language name or None if unsupported
+    """
+    _, ext = os.path.splitext(filename)
+    return EXTENSION_MAP.get(ext.lower())
+
 class UniversalParser:
     def __init__(self):
         # FIX: Use relative path to this file, not CWD.
@@ -84,9 +97,16 @@ class UniversalParser:
                 query_scm = f.read()
 
             # 4. Execute Query
-            # tree_sitter.Query expects (language, source) not language.query(source)
-            query = tree_sitter.Query(language, query_scm)
-            captures = query.captures(tree.root_node)
+            # FIX: Use language.query() method instead of Query constructor
+            # The tree-sitter-languages library uses a different API
+            try:
+                query = language.query(query_scm)
+                captures = query.captures(tree.root_node)
+            except AttributeError:
+                # Fallback for different tree-sitter versions
+                import tree_sitter
+                query = tree_sitter.Query(language, query_scm)
+                captures = query.captures(tree.root_node)
             
             return captures, code_bytes
 
@@ -108,7 +128,8 @@ class UniversalParser:
         Returns:
             (captures, code_bytes) or (None, None)
         """
-        if not lang_name:
+        if not lang_name or lang_name == "text":
+            logger.warning(f"Invalid language '{lang_name}', skipping parse")
             return None, None
         
         try:
@@ -130,9 +151,20 @@ class UniversalParser:
                 query_scm = f.read()
             
             # 4. Execute Query
-            # tree_sitter.Query expects (language, source) not language.query(source)
-            query = tree_sitter.Query(language, query_scm)
-            captures = query.captures(tree.root_node)
+            # Use language.query() method (correct API for tree-sitter-languages)
+            try:
+                query = language.query(query_scm)
+                captures = query.captures(tree.root_node)
+            except (AttributeError, TypeError):
+                # Fallback for older tree-sitter versions
+                import tree_sitter
+                try:
+                    query = tree_sitter.Query(language, query_scm)
+                    captures = query.captures(tree.root_node)
+                except TypeError:
+                    # tree_sitter.Query() no longer accepts arguments in newer versions
+                    logger.error(f"Tree-sitter API incompatibility for {lang_name}. Please update tree-sitter-languages.")
+                    return None, None
             
             return captures, code_bytes
         

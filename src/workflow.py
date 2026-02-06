@@ -15,7 +15,8 @@ from .gemini_client import GeminiClient, create_gemini_client
 from .analyzer import FileChange
 from .temporary_graph import TemporaryGraphBuilder, TemporaryVectorBuilder
 from .context_merger import ContextMerger
-from .parser import UniversalParser
+from .parser import UniversalParser, detect_language_from_filename
+from .review_validator import ReviewValidator
 from sentence_transformers import SentenceTransformer
 
 logger = setup_logger(__name__)
@@ -45,6 +46,7 @@ class ReviewState(TypedDict):
     
     # Context (from Phase 3)
     pr_context: NotRequired[Dict[str, Any]]  # PRContext from context_builder
+    _merged_contexts: NotRequired[Dict[str, Any]]  # Merged GraphRAG contexts (temporary + permanent)
     
     # Review Strategy
     review_strategy: NotRequired[Literal["quick", "standard", "deep"]]
@@ -97,9 +99,9 @@ class WorkflowConfig:
     standard_review_max_additions: int = 500
     
     # Gemini model configuration
-    flash_lite_model: str = "gemini-2.5-flash-latest"
-    flash_model: str = "gemini-2.5-flash-latest"
-    pro_model: str = "gemini-2.5-pro-latest"
+    flash_lite_model: str = "gemini-2.5-flash-lite"
+    flash_model: str = "gemini-2.5-flash"
+    pro_model: str = "gemini-2.5-pro"
     
     # Rate limiting
     max_requests_per_minute: int = 60
@@ -143,6 +145,7 @@ class CodeReviewWorkflow:
         self.config = config or WorkflowConfig()
         self.context_builder = context_builder
         self.gemini_client = gemini_client or create_gemini_client()
+        self.review_validator = ReviewValidator()
         self.graph = self._build_graph()
         self.compiled = None
         
@@ -256,6 +259,17 @@ class CodeReviewWorkflow:
                     if status == "deleted":
                         continue
                     
+                    # Detect language from filename if not provided by GitHub
+                    if not language:
+                        language = detect_language_from_filename(filename)
+                        if language:
+                            logger.info(f"[TempGraphRAG] Detected language '{language}' for {filename}")
+                    
+                    # Skip files with unsupported languages
+                    if not language or language == "text":
+                        logger.warning(f"[TempGraphRAG] Unsupported language for {filename}, skipping")
+                        continue
+                    
                     # For new/modified files, try to reconstruct full content from patch
                     # If patch is incomplete, we could fetch from GitHub API
                     # For now, use patch as best-effort content
@@ -275,7 +289,7 @@ class CodeReviewWorkflow:
                         continue
                     
                     # Process file with tree-sitter
-                    file_node = temp_graph.process_file(filename, content, language or "text")
+                    file_node = temp_graph.process_file(filename, content, language)
                     
                     # Add nodes to vector index
                     if file_node.nodes:
@@ -605,9 +619,12 @@ class CodeReviewWorkflow:
         try:
             pr_context = state.get("pr_context", {})
             
-            # Build quick review prompt
+            # Build quick review prompt with GraphRAG context
             issues_summary = self._format_issues_summary(pr_context)
             files_summary = self._format_files_summary(pr_context, max_files=10)
+            entities_summary = self._format_entities_summary(state)
+            dependencies_summary = self._format_dependencies_summary(state)
+            similar_code_summary = self._format_similar_code(pr_context, state)
             
             prompt = self.gemini_client.templates.QUICK_REVIEW_PROMPT.format(
                 pr_title=state["pr_title"],
@@ -616,7 +633,10 @@ class CodeReviewWorkflow:
                 deletions=pr_context.get("total_deletions", 0),
                 description=state.get("pr_description", "No description provided"),
                 files_summary=files_summary,
-                issues_summary=issues_summary
+                issues_summary=issues_summary,
+                entities=entities_summary,
+                dependencies=dependencies_summary,
+                similar_code=similar_code_summary
             )
             
             model = state.get("selected_model", self.config.flash_lite_model)
@@ -627,15 +647,27 @@ class CodeReviewWorkflow:
                 prompt=prompt
             )
             
+            # Validate GraphRAG usage
+            validation_result = self._validate_graphrag_usage(review, state)
+            state["graphrag_validation"] = validation_result
+            
             # Store review
             state["overall_summary"] = review
             state["processed_files"] = pr_context.get("total_files", 0)
             
-            logger.info(f"Quick review completed ({len(review)} chars)")
+            logger.info(
+                f"Quick review completed ({len(review)} chars, "
+                f"GraphRAG utilization: {validation_result['graphrag_utilization']:.1f}%)"
+            )
+            
+            if validation_result["issues"]:
+                logger.warning(
+                    f"[GRAPHRAG_VALIDATION] Quick review has {len(validation_result['issues'])} GraphRAG issues"
+                )
             
             state["messages"].append({
                 "role": "assistant",
-                "content": f"Quick review generated for {pr_context.get('total_files', 0)} files"
+                "content": f"Quick review generated for {pr_context.get('total_files', 0)} files (GraphRAG: {validation_result['graphrag_utilization']:.1f}%)"
             })
             
         except Exception as e:
@@ -755,7 +787,9 @@ class CodeReviewWorkflow:
                 affected_callers=pr_context.get("affected_callers", 0),
                 complexity_hotspots=self._format_complexity_hotspots(pr_context),
                 coupling_files=self._format_coupling_files(pr_context),
-                similar_code=self._format_similar_code(pr_context),
+                similar_code=self._format_similar_code(pr_context, state),
+                entities=self._format_entities_summary(state),
+                dependencies=self._format_dependencies_summary(state),
                 files_details=files_details
             )
             
@@ -768,14 +802,26 @@ class CodeReviewWorkflow:
                 prompt=prompt
             )
             
+            # Validate GraphRAG usage
+            validation_result = self._validate_graphrag_usage(review, state)
+            state["graphrag_validation"] = validation_result
+            
             state["overall_summary"] = review
             state["processed_files"] = len(files)
             
-            logger.info(f"Deep review completed ({len(review)} chars)")
+            logger.info(
+                f"Deep review completed ({len(review)} chars, "
+                f"GraphRAG utilization: {validation_result['graphrag_utilization']:.1f}%)"
+            )
+            
+            if validation_result["issues"]:
+                logger.warning(
+                    f"[GRAPHRAG_VALIDATION] Deep review has {len(validation_result['issues'])} GraphRAG issues"
+                )
             
             state["messages"].append({
                 "role": "assistant",
-                "content": f"Deep review generated with comprehensive analysis"
+                "content": f"Deep review generated with comprehensive analysis (GraphRAG: {validation_result['graphrag_utilization']:.1f}%)"
             })
             
         except Exception as e:
@@ -845,13 +891,26 @@ class CodeReviewWorkflow:
                 prompt=prompt
             )
             
+            # Validate GraphRAG usage in aggregated review
+            validation_result = self._validate_graphrag_usage(aggregated_review, state)
+            state["graphrag_validation"] = validation_result
+            
+            if validation_result["issues"]:
+                logger.warning(
+                    f"[GRAPHRAG_VALIDATION] Review has {len(validation_result['issues'])} GraphRAG usage issues. "
+                    f"Utilization: {validation_result['graphrag_utilization']:.1f}%"
+                )
+            
             state["overall_summary"] = aggregated_review
             
-            logger.info(f"Aggregation completed ({len(aggregated_review)} chars)")
+            logger.info(
+                f"Aggregation completed ({len(aggregated_review)} chars, "
+                f"GraphRAG utilization: {validation_result['graphrag_utilization']:.1f}%)"
+            )
             
             state["messages"].append({
                 "role": "assistant",
-                "content": "Final review aggregated from individual file reviews"
+                "content": f"Final review aggregated from individual file reviews (GraphRAG: {validation_result['graphrag_utilization']:.1f}%)"
             })
             
         except Exception as e:
@@ -949,13 +1008,82 @@ class CodeReviewWorkflow:
     # HELPER METHODS (Phase 4.4)
     # ========================================================================
     
-    async def _review_single_file(self, model: str, file_ctx: Dict, state: ReviewState) -> Dict[str, Any]:
-        """Review a single file with Gemini"""
+    async def _quick_scan_file(self, file_ctx: Dict, state: ReviewState) -> Dict[str, Any]:
+        """Phase 3: Quick scan for critical issues (Pass 1)
+        
+        Fast scan to identify:
+        - Security vulnerabilities
+        - Critical bugs
+        - Immediate blockers
+        
+        Returns dict with critical_issues flag and quick summary
+        """
         try:
-            # Format issues summary from the dict of counts
+            filename = file_ctx.get("filename", "unknown")
+            logger.info(f"[PHASE3] Quick scanning {filename}...")
+            
+            # Get file diff
+            diff = self._get_file_diff(state["files"], filename)
+            formatted_diff = self.format_diff_for_review(diff, filename)
+            
+            # Quick scan prompt - focused on critical issues only
+            prompt = self.gemini_client.templates.QUICK_SCAN_PROMPT.format(
+                filename=filename,
+                language=file_ctx.get("language", "unknown"),
+                additions=file_ctx.get("additions", 0),
+                deletions=file_ctx.get("deletions", 0),
+                diff=formatted_diff
+            )
+            
+            # Use faster model for quick scan
+            scan_result = await self.gemini_client.generate_review(
+                model_name="gemini-2.0-flash-exp",  # Fast model
+                prompt=prompt
+            )
+            
+            # Parse for critical issues
+            has_critical = any([
+                "🔴" in scan_result,
+                "CRITICAL" in scan_result.upper(),
+                "SECURITY" in scan_result.upper(),
+                "VULNERABILITY" in scan_result.upper()
+            ])
+            
+            logger.info(f"[PHASE3] Quick scan complete for {filename} (critical: {has_critical})")
+            
+            return {
+                "filename": filename,
+                "has_critical": has_critical,
+                "quick_summary": scan_result,
+                "scan_time": "quick"
+            }
+            
+        except Exception as e:
+            logger.error(f"[PHASE3] Error in quick scan for {file_ctx.get('filename')}: {e}")
+            return {
+                "filename": file_ctx.get("filename", "unknown"),
+                "has_critical": False,  # Assume no critical to avoid blocking
+                "quick_summary": f"Quick scan error: {str(e)}",
+                "error": True
+            }
+    
+    async def _detailed_review_file(self, model: str, file_ctx: Dict, state: ReviewState, quick_scan: Dict) -> Dict[str, Any]:
+        """Phase 3: Detailed review with GraphRAG (Pass 2)
+        
+        Deep analysis including:
+        - All issue levels
+        - GraphRAG context integration
+        - Similar code patterns
+        - Dependency impact
+        - Refactoring opportunities
+        """
+        try:
+            filename = file_ctx.get("filename", "unknown")
+            logger.info(f"[PHASE3] Detailed review for {filename} (has_critical: {quick_scan.get('has_critical')})")
+            
+            # Format issues summary
             issues_summary = file_ctx.get("issues_summary", {})
             if isinstance(issues_summary, dict) and all(isinstance(k, str) for k in issues_summary.keys()):
-                # issues_summary is {"critical": 0, "high": 1, "medium": 2, "low": 0}
                 issue_parts = []
                 for severity in ["critical", "high", "medium", "low"]:
                     count = issues_summary.get(severity, 0)
@@ -965,28 +1093,34 @@ class CodeReviewWorkflow:
             else:
                 issues = "No issues detected"
             
-            # Handle dependencies - should be a list of strings
+            # Handle dependencies
             deps = file_ctx.get("dependencies", [])
             if isinstance(deps, list) and deps:
-                dependencies = "\n".join([f"- {dep}" for dep in deps[:10]])  # Limit to 10
+                dependencies = "\n".join([f"- {dep}" for dep in deps[:10]])
             else:
                 dependencies = "None"
             
-            # Extract similar code from context (GraphRAG!)
-            similar_code = self._format_similar_code_for_file(file_ctx, state)
+            # Extract similar code from context (GraphRAG!) - ENHANCED
+            similar_code = self._format_similar_code_for_file_enhanced(file_ctx, state)
             
-            # Get file diff if available
-            diff = self._get_file_diff(state["files"], file_ctx.get("filename", "unknown"))
+            # Format entities with relationships - NEW
+            entities = self._format_entities_for_file(file_ctx, state)
             
+            # Get file diff
+            diff = self._get_file_diff(state["files"], filename)
+            formatted_diff = self.format_diff_for_review(diff, filename)
+            
+            # Phase 3: Include quick scan findings in detailed review
             prompt = self.gemini_client.templates.FILE_REVIEW_PROMPT.format(
-                filename=file_ctx.get("filename", "unknown"),
+                filename=filename,
                 language=file_ctx.get("language", "unknown"),
                 additions=file_ctx.get("additions", 0),
                 deletions=file_ctx.get("deletions", 0),
                 issues=issues,
                 similar_code=similar_code,
                 dependencies=dependencies,
-                diff=diff[:2000]  # Limit diff size
+                entities=entities,  # NEW
+                diff=formatted_diff
             )
             
             review_text = await self.gemini_client.generate_review(
@@ -994,17 +1128,72 @@ class CodeReviewWorkflow:
                 prompt=prompt
             )
             
-            # Calculate issues_found from issues_summary dict
+            # Phase 4: Validate review against actual diff
+            files_for_validation = [{
+                "filename": filename,
+                "patch": diff
+            }]
+            is_valid, validation_warnings, validation_metrics = self.review_validator.validate_review(
+                review_text,
+                files_for_validation
+            )
+            
+            # Log validation results
+            if not is_valid:
+                logger.warning(f"[PHASE4] Review validation failed for {filename}: {len(validation_warnings)} warnings")
+                for warning in validation_warnings[:3]:  # Log first 3 warnings
+                    logger.warning(f"[PHASE4] {warning}")
+            else:
+                logger.info(f"[PHASE4] Review validated successfully for {filename}")
+            
+            # Calculate issues_found
             issues_found = 0
             if isinstance(issues_summary, dict):
                 issues_found = sum(v for v in issues_summary.values() if isinstance(v, int))
             
+            logger.info(f"[PHASE3] Detailed review complete for {filename}")
+            
             return {
-                "filename": file_ctx.get("filename", "unknown"),
+                "filename": filename,
                 "summary": review_text,
                 "language": file_ctx.get("language"),
-                "issues_found": issues_found
+                "issues_found": issues_found,
+                "review_type": "two_pass",
+                "validation": {
+                    "is_valid": is_valid,
+                    "warnings": validation_warnings,
+                    "metrics": validation_metrics
+                }
             }
+            
+        except Exception as e:
+            logger.error(f"[PHASE3] Error in detailed review for {file_ctx.get('filename')}: {e}", exc_info=True)
+            return {
+                "filename": file_ctx.get("filename", "unknown"),
+                "summary": f"Unable to complete detailed review: {str(e)}",
+                "error": True
+            }
+    
+    async def _review_single_file(self, model: str, file_ctx: Dict, state: ReviewState) -> Dict[str, Any]:
+        """Phase 3: Review a single file using two-pass strategy
+        
+        Pass 1: Quick scan for critical issues (fast)
+        Pass 2: Detailed review with GraphRAG (thorough)
+        
+        """
+        try:
+            # Phase 3: Two-Pass Review Strategy
+            # Pass 1: Quick scan for critical issues
+            quick_scan = await self._quick_scan_file(file_ctx, state)
+            
+            # Pass 2: Detailed review with GraphRAG context
+            detailed_review = await self._detailed_review_file(model, file_ctx, state, quick_scan)
+            
+            # Return detailed review with quick scan metadata
+            detailed_review["quick_scan_performed"] = True
+            detailed_review["critical_detected_in_scan"] = quick_scan.get("has_critical", False)
+            
+            return detailed_review
             
         except Exception as e:
             logger.error(f"Error reviewing file {file_ctx.get('filename', 'unknown')}: {e}", exc_info=True)
@@ -1173,10 +1362,256 @@ class CodeReviewWorkflow:
             for c in coupling[:5]
         ])
     
-    def _format_similar_code(self, pr_context: Dict) -> str:
-        """Format similar code patterns for overall PR review"""
-        # This would come from vector search results
-        return "See individual file reviews for similar code patterns"
+    def _format_entities_summary(self, state: Dict) -> str:
+        """Format entities summary from GraphRAG for review context"""
+        merged_contexts = state.get("_merged_contexts", {})
+        
+        if not merged_contexts:
+            return "None - GraphRAG context not available"
+        
+        all_entities = []
+        for filename, context in merged_contexts.items():
+            entities = context.get("entities", [])
+            for entity in entities[:5]:  # Top 5 per file
+                all_entities.append({
+                    "name": entity.get("name", "unknown"),
+                    "type": entity.get("type", "unknown"),
+                    "file": filename
+                })
+        
+        if not all_entities:
+            return "None found - repository may need re-ingestion"
+        
+        parts = ["\n📊 Key Entities (GraphRAG):"]
+        for entity in all_entities[:15]:  # Top 15 overall
+            parts.append(f"  - {entity['name']} ({entity['type']}) in {entity['file']}")
+        
+        logger.info(f"[GRAPHRAG] Formatted {len(all_entities)} entities for review")
+        return "\n".join(parts)
+    
+    def _format_dependencies_summary(self, state: Dict) -> str:
+        """Format dependencies summary from GraphRAG for review context"""
+        merged_contexts = state.get("_merged_contexts", {})
+        
+        if not merged_contexts:
+            return "None - GraphRAG context not available"
+        
+        all_deps = []
+        for filename, context in merged_contexts.items():
+            dependencies = context.get("dependencies", [])
+            for dep in dependencies[:5]:  # Top 5 per file
+                all_deps.append({
+                    "source": dep.get("source", "unknown"),
+                    "target": dep.get("target", "unknown"),
+                    "type": dep.get("type", "unknown"),
+                    "file": filename
+                })
+        
+        if not all_deps:
+            return "None found - repository may need re-ingestion"
+        
+        parts = ["\n🔗 Dependencies (GraphRAG):"]
+        for dep in all_deps[:15]:  # Top 15 overall
+            parts.append(f"  - {dep['source']} → {dep['target']} ({dep['type']}) in {dep['file']}")
+        
+        logger.info(f"[GRAPHRAG] Formatted {len(all_deps)} dependencies for review")
+        return "\n".join(parts)
+    
+    def _validate_graphrag_usage(self, review_text: str, state: Dict) -> Dict[str, any]:
+        """Validate that review actually uses GraphRAG context when available"""
+        merged_contexts = state.get("_merged_contexts", {})
+        
+        validation_result = {
+            "has_graphrag_data": bool(merged_contexts),
+            "mentions_dependencies": False,
+            "mentions_similar_code": False,
+            "mentions_entities": False,
+            "graphrag_utilization": 0.0,
+            "issues": []
+        }
+        
+        if not merged_contexts:
+            logger.info("[GRAPHRAG_VALIDATION] No GraphRAG data available - skipping validation")
+            return validation_result
+        
+        # Count available GraphRAG data
+        total_deps = 0
+        total_similar = 0
+        total_entities = 0
+        
+        for filename, context in merged_contexts.items():
+            total_deps += len(context.get("dependencies", []))
+            total_similar += len(context.get("similar_code", []))
+            total_entities += len(context.get("entities", []))
+        
+        # Check if review mentions GraphRAG insights
+        review_lower = review_text.lower()
+        
+        validation_result["mentions_dependencies"] = (
+            "dependenc" in review_lower or 
+            "depends on" in review_lower or
+            "→" in review_text  # Dependency arrow
+        )
+        
+        validation_result["mentions_similar_code"] = (
+            "similar" in review_lower or
+            "pattern" in review_lower or
+            "duplicate" in review_lower or
+            "🔍" in review_text  # Magnifying glass emoji
+        )
+        
+        validation_result["mentions_entities"] = (
+            "entit" in review_lower or
+            "function" in review_lower or
+            "class" in review_lower
+        )
+        
+        # Calculate utilization score
+        mentions = 0
+        available = 0
+        
+        if total_deps > 0:
+            available += 1
+            if validation_result["mentions_dependencies"]:
+                mentions += 1
+            else:
+                validation_result["issues"].append(
+                    f"GraphRAG has {total_deps} dependencies but review doesn't mention them"
+                )
+        
+        if total_similar > 0:
+            available += 1
+            if validation_result["mentions_similar_code"]:
+                mentions += 1
+            else:
+                validation_result["issues"].append(
+                    f"GraphRAG has {total_similar} similar code patterns but review doesn't mention them"
+                )
+        
+        if total_entities > 0:
+            available += 1
+            if validation_result["mentions_entities"]:
+                mentions += 1
+        
+        if available > 0:
+            validation_result["graphrag_utilization"] = (mentions / available) * 100
+        
+        logger.info(
+            f"[GRAPHRAG_VALIDATION] Utilization: {validation_result['graphrag_utilization']:.1f}% "
+            f"({mentions}/{available} contexts used)"
+        )
+        
+        if validation_result["issues"]:
+            for issue in validation_result["issues"]:
+                logger.warning(f"[GRAPHRAG_VALIDATION] {issue}")
+        
+        return validation_result
+    
+    def format_diff_for_review(self, diff: str, filename: str = "") -> str:
+        """
+        Phase 1: Format diff with line numbers for better context in reviews
+        
+        Transforms unified diff format to include clear line number references
+        and removes truncation to preserve full context.
+        
+        Args:
+            diff: Raw unified diff string
+            filename: Optional filename for context
+            
+        Returns:
+            Formatted diff with line numbers and full context
+        """
+        if not diff or not diff.strip():
+            return "No diff available"
+        
+        lines = diff.split('\n')
+        formatted_lines = []
+        current_old_line = 0
+        current_new_line = 0
+        
+        for line in lines:
+            # Parse hunk headers: @@ -10,5 +12,6 @@
+            if line.startswith('@@'):
+                # Extract line numbers from hunk header
+                import re
+                match = re.match(r'@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
+                if match:
+                    current_old_line = int(match.group(1))
+                    current_new_line = int(match.group(2))
+                formatted_lines.append(f"\n{line}")
+            
+            # Format added lines with new line number
+            elif line.startswith('+') and not line.startswith('+++'):
+                formatted_lines.append(f"L{current_new_line}+ | {line[1:]}")
+                current_new_line += 1
+            
+            # Format removed lines with old line number
+            elif line.startswith('-') and not line.startswith('---'):
+                formatted_lines.append(f"L{current_old_line}- | {line[1:]}")
+                current_old_line += 1
+            
+            # Format context lines with both line numbers
+            elif line.startswith(' '):
+                formatted_lines.append(f"L{current_new_line}  | {line[1:]}")
+                current_old_line += 1
+                current_new_line += 1
+            
+            # Keep file headers
+            elif line.startswith('---') or line.startswith('+++') or line.startswith('diff'):
+                formatted_lines.append(line)
+            
+            # Keep other lines as-is
+            else:
+                formatted_lines.append(line)
+        
+        result = '\n'.join(formatted_lines)
+        
+        # Add header if filename provided
+        if filename:
+            result = f"## File: {filename}\n\n{result}"
+        
+        return result
+    
+    def _format_similar_code(self, pr_context: Dict, state: Dict) -> str:
+        """
+        ENHANCED: Format similar code patterns with actual code snippets
+        """
+        merged_contexts = state.get("_merged_contexts", {})
+        
+        if not merged_contexts:
+            logger.warning("[GRAPHRAG] No merged contexts available for similar code formatting")
+            return "None - GraphRAG context not available"
+        
+        # Collect all similar code with snippets
+        all_similar_with_code = []
+        for filename, context in merged_contexts.items():
+            similar_code = context.get("similar_code", [])
+            for sim in similar_code[:2]:  # Top 2 per file
+                all_similar_with_code.append(sim)
+        
+        if not all_similar_with_code:
+            logger.info("[GRAPHRAG] No similar code patterns found in merged contexts")
+            return "None found - repository may need re-ingestion"
+        
+        # Use enhanced formatter with code snippets
+        if self.context_builder:
+            formatted = self.context_builder.format_similar_code_with_snippets(
+                similar_code=all_similar_with_code,
+                max_items=8  # Show top 8 for deep review
+            )
+            logger.info(f"[GRAPHRAG] Formatted {len(all_similar_with_code)} similar code patterns with snippets")
+            return formatted
+        
+        # Fallback to basic format
+        parts = []
+        for idx, sim in enumerate(all_similar_with_code[:8], 1):
+            metadata = sim.get("metadata", {})
+            score = sim.get("score", 0)
+            file = metadata.get("file", "unknown")
+            line = metadata.get("line", "?")
+            parts.append(f"{idx}. {file}:L{line} (similarity: {score:.2f})")
+        
+        return "\n".join(parts) if parts else "None"
     
     def _format_similar_code_for_file(self, file_ctx: Dict, state: Dict) -> str:
         """
@@ -1190,29 +1625,35 @@ class CodeReviewWorkflow:
         if merged:
             similar_code = merged.get("similar_code", [])
             if similar_code:
-                parts = [f"\n🔍 Similar Code Analysis:"]
+                logger.info(f"[SIMILAR_CODE] Found {len(similar_code)} similar items from merged context for {file_ctx.get('filename')}")
+                parts = [f"\n🔍 Similar Code Analysis (GraphRAG):"]
                 for sim in similar_code[:5]:  # Top 5 matches
                     metadata = sim.get("metadata", {})
                     source = sim.get("source", "unknown")
-                    source_label = "🆕 PR" if source == "temporary" else "📦 Main"
+                    source_label = "🆕 PR" if source == "temporary" else "📦 Repo"
                     
                     parts.append(
                         f"  {source_label} {metadata.get('file', 'unknown')} "
-                        f"(score: {sim.get('score', 0):.2f}, "
+                        f"(similarity: {sim.get('score', 0):.2f}, "
                         f"line {metadata.get('line', '?')}, "
                         f"type: {metadata.get('type', 'unknown')})"
                     )
                 return "\n".join(parts)
+            else:
+                logger.warning(f"[SIMILAR_CODE] Merged context exists but no similar_code for {file_ctx.get('filename')}")
         
         # Fallback to legacy entity-based similar code
         entities = file_ctx.get("entities", [])
         if not entities:
-            return "None found"
+            logger.warning(f"[SIMILAR_CODE] No entities found for {file_ctx.get('filename')}")
+            return "None found (repository may need ingestion)"
         
         similar_parts = []
+        total_similar = 0
         for entity in entities[:3]:  # Top 3 entities with similar code
             similar = entity.get("similar_code", [])
             if similar:
+                total_similar += len(similar)
                 similar_parts.append(f"\nEntity: {entity.get('name')}")
                 for sim in similar[:2]:  # Top 2 similar matches per entity
                     similar_parts.append(
@@ -1221,8 +1662,85 @@ class CodeReviewWorkflow:
                     )
         
         if similar_parts:
+            logger.info(f"[SIMILAR_CODE] Found {total_similar} similar items from entities for {file_ctx.get('filename')}")
             return "\n".join(similar_parts)
-        return "None found"
+        
+        logger.warning(f"[SIMILAR_CODE] No similar code found for {file_ctx.get('filename')} - GraphRAG may not have data")
+        return "None found (repository may need ingestion)"
+    
+    def _format_similar_code_for_file_enhanced(self, file_ctx: Dict, state: Dict) -> str:
+        """
+        ENHANCED: Format similar code with actual code snippets
+        """
+        # Get merged context
+        merged_contexts = state.get("_merged_contexts", {})
+        merged = merged_contexts.get(file_ctx.get("filename"))
+        
+        if not merged or not merged.get("similar_code"):
+            return "None found (repository may need ingestion)"
+        
+        # Use context_builder's formatter
+        if self.context_builder:
+            return self.context_builder.format_similar_code_with_snippets(
+                similar_code=merged.get("similar_code", []),
+                max_items=5
+            )
+        
+        # Fallback to basic format
+        return self._format_similar_code_for_file(file_ctx, state)
+    
+    def _format_entities_for_file(self, file_ctx: Dict, state: Dict) -> str:
+        """
+        Format entities with relationships for richer context
+        """
+        # Get entities from file context
+        entities = file_ctx.get("entities", [])
+        
+        if not entities:
+            return "None"
+        
+        # Use context_builder's formatter
+        if self.context_builder:
+            return self.context_builder.format_entities_with_relationships(
+                entities=entities,
+                max_entities=8
+            )
+        
+        # Fallback to basic format
+        formatted = []
+        for entity in entities[:5]:
+            name = entity.get("name", "unknown")
+            entity_type = entity.get("type", "function")
+            formatted.append(f"• `{name}` ({entity_type})")
+        
+        return "\n".join(formatted) if formatted else "None"
+    
+    def _format_dependencies_for_file_enhanced(self, file_ctx: Dict) -> str:
+        """
+        ENHANCED: Format dependencies with impact analysis
+        """
+        dependencies = file_ctx.get("dependencies", [])
+        dependents = file_ctx.get("dependents", [])
+        filename = file_ctx.get("filename", "unknown")
+        
+        if self.context_builder:
+            return self.context_builder.format_dependencies_with_impact(
+                dependencies=dependencies,
+                dependents=dependents,
+                filename=filename
+            )
+        
+        # Fallback
+        if not dependencies and not dependents:
+            return "None"
+        
+        parts = []
+        if dependencies:
+            parts.append(f"Depends on: {', '.join(dependencies[:5])}")
+        if dependents:
+            parts.append(f"Used by: {', '.join(dependents[:5])}")
+        
+        return "\n".join(parts) if parts else "None"
     
     def _find_file_context(self, files: List[Dict], filename: str) -> Optional[Dict]:
         """Find file context by filename"""

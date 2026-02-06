@@ -358,6 +358,19 @@ class ReviewQueue:
         
         self.logger.info(f"Workflow completed for {task.repo_full_name} PR #{task.pr_number}")
         
+        # Check if workflow failed (don't post partial/error reviews)
+        workflow_status = final_state.get("status")
+        if workflow_status == "failed":
+            error_msg = "Workflow failed to generate review"
+            errors = final_state.get("errors", [])
+            if errors:
+                last_error = errors[-1]
+                error_msg = f"{error_msg}: {last_error.get('message', 'Unknown error')}"
+                
+            self.logger.error(error_msg)
+            # Raise error to trigger task retry/failure logic in worker
+            raise RuntimeError(error_msg)
+        
         # Step 4: Post review to GitHub
         poster = create_review_poster(strategy=strategy)
         post_result = await poster.post_review(

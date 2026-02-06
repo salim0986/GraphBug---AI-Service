@@ -112,7 +112,8 @@ class ContextBuilder:
         
         This is the main entry point that orchestrates all analysis
         """
-        logger.info(f"Building context for PR #{pr_number} in repo {repo_id}")
+        logger.info(f"[ContextBuilder] Building context for PR #{pr_number} in repo {repo_id}")
+        logger.info(f"[ContextBuilder] Input: {len(files)} files, base={base_ref}, head={head_ref}")
         
         # 1. Analyze PR with CodeAnalyzer
         pr_analysis = await self.analyzer.analyze_pr(PRAnalysisRequest(
@@ -220,22 +221,42 @@ class ContextBuilder:
     ) -> FileContext:
         """Build context for a single file"""
         
+        logger.debug(f"[ContextBuilder] Building context for file: {filename}")
+        logger.debug(f"[ContextBuilder]   repo_id={repo_id}, language={language}")
+        
         # Get entities in the file from graph
         entities_data = self.graph_db.find_related_by_file(repo_id, filename, limit=50)
+        logger.debug(f"[ContextBuilder]   Found {len(entities_data)} entities from Neo4j for {filename}")
         
         # Build entity contexts with similar code from vector search
         entities = []
         for entity_data in entities_data:
             # Map similar code for this entity (from vector search)
-            entity_similar = [
-                {
-                    "file": sim.file,
-                    "score": sim.score,
-                    "line": getattr(sim, 'line_number', 0),
-                    "snippet": getattr(sim, 'code_snippet', '')[:200]
-                }
-                for sim in similar_code if hasattr(sim, 'file')
-            ][:3]  # Top 3 similar
+            # Convert SimilarCode Pydantic models to dicts
+            entity_similar = []
+            for sim in similar_code:
+                if hasattr(sim, 'file'):  # It's a Pydantic model
+                    entity_similar.append({
+                        "file": sim.file,
+                        "score": sim.similarity_score,
+                        "line": sim.line,
+                        "snippet": sim.code_snippet[:200] if sim.code_snippet else "",
+                        "reason": sim.reason or ""
+                    })
+            entity_similar = entity_similar[:3]  # Top 3 similar
+            
+            # Convert RelatedCode objects to dicts
+            entity_related = []
+            for rel in related_code:
+                if hasattr(rel, 'file'):  # It's a Pydantic model
+                    entity_related.append({
+                        "file": rel.file,
+                        "name": rel.name,
+                        "type": rel.type,
+                        "reason": rel.reason,
+                        "line": rel.line
+                    })
+            entity_related = entity_related[:5]  # Top 5 related
             
             entity_ctx = CodeContext(
                 name=entity_data["name"],
@@ -243,7 +264,7 @@ class ContextBuilder:
                 file=filename,
                 line=entity_data["line"],
                 code=entity_data.get("code", ""),
-                related_entities=related_code[:5] if related_code else [],
+                related_entities=entity_related,
                 similar_code=entity_similar,
                 issues=[]
             )
@@ -252,6 +273,7 @@ class ContextBuilder:
         # Get file dependencies
         dependencies = self.graph_db.find_file_dependencies(repo_id, filename)
         dep_files = [dep["file"] for dep in dependencies]
+        logger.debug(f"[ContextBuilder]   Found {len(dep_files)} dependencies for {filename}")
         
         # Aggregate issues by severity
         issues_summary = {
@@ -407,3 +429,265 @@ class ContextBuilder:
                 summary_lines.append(f"  • {rec}")
         
         return "\n".join(summary_lines)
+    
+    # ============================================================================
+    # ENHANCED FORMATTERS FOR RICH CODE CONTEXT (Phase 4.1 Enhancement)
+    # ============================================================================
+    
+    def extract_code_snippet(
+        self,
+        patch: str,
+        target_line: int,
+        context_lines: int = 3
+    ) -> Dict[str, Any]:
+        """
+        Extract code snippet from patch with context around a specific line
+        
+        Args:
+            patch: Git diff patch
+            target_line: Line number to extract context around
+            context_lines: Number of lines before/after to include
+            
+        Returns:
+            {
+                "snippet": "formatted code with line numbers",
+                "start_line": int,
+                "end_line": int,
+                "has_target": bool,
+                "raw_lines": List[Dict]
+            }
+        """
+        import re
+        
+        if not patch:
+            return {
+                "snippet": "",
+                "start_line": target_line,
+                "end_line": target_line,
+                "has_target": False,
+                "raw_lines": []
+            }
+        
+        lines = patch.split('\n')
+        snippet_lines = []
+        current_line = 0
+        target_found = False
+        
+        for line in lines:
+            # Parse hunk headers to track line numbers
+            if line.startswith('@@'):
+                match = re.search(r'@@ -\d+,?\d* \+(\d+),?\d* @@', line)
+                if match:
+                    current_line = int(match.group(1)) - 1
+                continue
+            
+            # Process added lines
+            if line.startswith('+') and not line.startswith('+++'):
+                current_line += 1
+                if abs(current_line - target_line) <= context_lines:
+                    snippet_lines.append({
+                        "line": current_line,
+                        "code": line[1:],  # Remove + prefix
+                        "type": "added",
+                        "is_target": current_line == target_line
+                    })
+                    if current_line == target_line:
+                        target_found = True
+            
+            # Process removed lines
+            elif line.startswith('-') and not line.startswith('---'):
+                if abs(current_line - target_line) <= context_lines:
+                    snippet_lines.append({
+                        "line": current_line,
+                        "code": line[1:],  # Remove - prefix
+                        "type": "removed"
+                    })
+            
+            # Process context lines
+            elif line.startswith(' '):
+                current_line += 1
+                if abs(current_line - target_line) <= context_lines:
+                    snippet_lines.append({
+                        "line": current_line,
+                        "code": line[1:],  # Remove space prefix
+                        "type": "context"
+                    })
+        
+        # Format snippet with markers
+        formatted_lines = []
+        for item in snippet_lines:
+            prefix = "→" if item.get("is_target") else " "
+            marker = "+" if item["type"] == "added" else "-" if item["type"] == "removed" else " "
+            formatted_lines.append(f"{prefix} {item['line']:3d} {marker} {item['code']}")
+        
+        return {
+            "snippet": "\n".join(formatted_lines),
+            "start_line": snippet_lines[0]["line"] if snippet_lines else target_line,
+            "end_line": snippet_lines[-1]["line"] if snippet_lines else target_line,
+            "has_target": target_found,
+            "raw_lines": snippet_lines
+        }
+    
+    def format_similar_code_with_snippets(
+        self,
+        similar_code: List[Any],
+        max_items: int = 5
+    ) -> str:
+        """
+        Format similar code with actual code snippets for richer context
+        
+        Args:
+            similar_code: List of similar code items
+            max_items: Maximum number of items to include
+            
+        Returns:
+            Formatted string with code snippets
+        """
+        if not similar_code:
+            return "None"
+        
+        formatted = []
+        for idx, similar in enumerate(similar_code[:max_items], 1):
+            # Handle different object types
+            if hasattr(similar, 'file'):
+                file = similar.file
+                line = similar.line
+                score = similar.similarity_score
+                snippet = getattr(similar, 'code_snippet', None)
+                reason = getattr(similar, 'reason', 'Similar pattern detected')
+            else:
+                file = similar.get('file', 'unknown')
+                line = similar.get('line', 0)
+                score = similar.get('similarity', 0.0)
+                snippet = similar.get('code_snippet') or similar.get('code')
+                reason = similar.get('reason', 'Similar pattern detected')
+            
+            entry = f"\n**{idx}. {file}:L{line}** (similarity: {score:.2f})\n"
+            
+            if snippet:
+                # Truncate if too long
+                if len(snippet) > 300:
+                    snippet = snippet[:300] + "\n..."
+                
+                # Detect language from file extension
+                language = self._detect_language_from_filename(file)
+                
+                entry += f"```{language}\n{snippet}\n```\n"
+            
+            entry += f"_{reason}_\n"
+            formatted.append(entry)
+        
+        return "\n".join(formatted)
+    
+    def format_dependencies_with_impact(
+        self,
+        dependencies: List[Any],
+        dependents: List[Any],
+        filename: str
+    ) -> str:
+        """
+        Format dependencies with impact analysis
+        
+        Args:
+            dependencies: List of upstream dependencies
+            dependents: List of downstream dependents
+            filename: Current file name
+            
+        Returns:
+            Formatted string with dependency impact
+        """
+        if not dependencies and not dependents:
+            return "None - File is isolated"
+        
+        parts = []
+        
+        # Upstream dependencies
+        if dependencies:
+            parts.append("**Upstream (what this file depends on):**")
+            for dep in dependencies[:5]:
+                dep_name = dep if isinstance(dep, str) else dep.get("name", "unknown")
+                parts.append(f"• `{dep_name}`")
+                parts.append(f"  _Changes to this dependency may require updates here_")
+        
+        # Downstream dependents
+        if dependents:
+            if parts:
+                parts.append("")
+            parts.append("**Downstream (what depends on this file):**")
+            for dependent in dependents[:5]:
+                dep_name = dependent if isinstance(dependent, str) else dependent.get("name", "unknown")
+                parts.append(f"• `{dep_name}`")
+                parts.append(f"  _Changes here will affect this file_")
+        
+        return "\n".join(parts)
+    
+    def format_entities_with_relationships(
+        self,
+        entities: List[Any],
+        max_entities: int = 8
+    ) -> str:
+        """
+        Format entities with their relationships and call graphs
+        
+        Args:
+            entities: List of code entities (functions, classes)
+            max_entities: Maximum entities to include
+            
+        Returns:
+            Formatted string with entity relationships
+        """
+        if not entities:
+            return "None"
+        
+        formatted = []
+        for entity in entities[:max_entities]:
+            # Handle different object types
+            if hasattr(entity, 'name'):
+                name = entity.name
+                entity_type = entity.type
+                entity_dict = entity.model_dump() if hasattr(entity, 'model_dump') else {}
+            else:
+                name = entity.get("name", "unknown")
+                entity_type = entity.get("type", "function")
+                entity_dict = entity
+            
+            # Build tree structure
+            tree = [f"**`{name}`** ({entity_type})"]
+            
+            # Get relationships
+            calls = entity_dict.get("calls", [])
+            called_by = entity_dict.get("called_by", [])
+            dependencies = entity_dict.get("dependencies", [])
+            
+            if calls:
+                calls_list = ", ".join(f"`{c}`" for c in calls[:5])
+                if len(calls) > 5:
+                    calls_list += f" _(+{len(calls)-5} more)_"
+                tree.append(f"├─ Calls: {calls_list}")
+            
+            if called_by:
+                callers = ", ".join(f"`{c}`" for c in called_by[:3])
+                if len(called_by) > 3:
+                    callers += f" _(+{len(called_by)-3} more)_"
+                tree.append(f"├─ Called by: {callers}")
+            
+            if dependencies:
+                deps = ", ".join(f"`{d}`" for d in dependencies[:3])
+                tree.append(f"└─ Uses: {deps}")
+            
+            formatted.append("\n".join(tree))
+        
+        return "\n\n".join(formatted)
+    
+    def _detect_language_from_filename(self, filename: str) -> str:
+        """Detect programming language from filename"""
+        ext_map = {
+            '.py': 'python', '.js': 'javascript', '.ts': 'typescript',
+            '.tsx': 'tsx', '.jsx': 'jsx', '.java': 'java',
+            '.go': 'go', '.rs': 'rust', '.cpp': 'cpp', '.c': 'c',
+            '.rb': 'ruby', '.php': 'php', '.cs': 'csharp'
+        }
+        
+        import os
+        _, ext = os.path.splitext(filename)
+        return ext_map.get(ext.lower(), '')

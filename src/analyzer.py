@@ -68,20 +68,21 @@ class CodeIssue(BaseModel):
 
 class SimilarCode(BaseModel):
     """Similar code found via vector search"""
-    filename: str
-    function_name: str
+    file: str  # Changed from filename for consistency
+    name: str  # Changed from function_name
     similarity_score: float
-    code_snippet: str
-    line_number: int
+    code_snippet: Optional[str] = None
+    line: int  # Changed from line_number
+    reason: Optional[str] = None  # Add reason field
 
 
 class RelatedCode(BaseModel):
     """Related code found via graph traversal"""
-    filename: str
-    node_type: str  # 'function', 'class', 'method'
+    file: str  # Changed from filename for consistency
+    type: str  # Changed from node_type
     name: str
-    relationship: str  # 'calls', 'called_by', 'imports', 'imported_by'
-    line_number: int
+    reason: str  # Changed from relationship for better clarity
+    line: Optional[int] = None  # Changed from line_number, made optional
 
 
 class FileAnalysisResult(BaseModel):
@@ -716,17 +717,20 @@ class CodeAnalyzer:
                 min_score=0.7
             )
             
+            logger.info(f"[SIMILAR_CODE] Vector search returned {len(similar_results)} results for {filename}")
+            
             for result in similar_results:
                 # Skip if it's the same file and line (exact match)
-                if result["file"] == filename and abs(result["line"] - 1) < 5:
+                if result.get("file") == filename and abs(result.get("line", 0) - 1) < 5:
                     continue
                 
                 similar.append(SimilarCode(
-                    file=result["file"],
-                    name=result["name"],
-                    similarity_score=result["similarity"],
-                    reason=self._get_similarity_reason(result["similarity"]),
-                    line=result["line"]
+                    file=result.get("file", "unknown"),
+                    name=result.get("name", "unknown"),
+                    similarity_score=result.get("similarity", 0.0),
+                    code_snippet=result.get("code", "")[:200] if result.get("code") else None,
+                    line=result.get("line", 0),
+                    reason=self._get_similarity_reason(result.get("similarity", 0.0))
                 ))
             
             # Also check for high-confidence duplicates (90%+ similarity)
@@ -740,20 +744,23 @@ class CodeAnalyzer:
                 
                 for dup in duplicates:
                     # Skip if already added or same location
-                    if dup["file"] == filename:
+                    if dup.get("file") == filename:
                         continue
                     
-                    if not any(s.file == dup["file"] and s.line == dup["line"] for s in similar):
+                    if not any(s.file == dup.get("file") and s.line == dup.get("line") for s in similar):
                         similar.append(SimilarCode(
-                            file=dup["file"],
-                            name=dup["name"],
-                            similarity_score=dup["similarity"],
-                            reason="Potential duplicate code - consider refactoring",
-                            line=dup["line"]
+                            file=dup.get("file", "unknown"),
+                            name=dup.get("name", "unknown"),
+                            similarity_score=dup.get("similarity", 0.0),
+                            code_snippet=dup.get("code", "")[:200] if dup.get("code") else None,
+                            line=dup.get("line", 0),
+                            reason="Potential duplicate code - consider refactoring"
                         ))
             
             if similar:
-                logger.info(f"Found {len(similar)} similar code patterns for {filename}")
+                logger.info(f"[SIMILAR_CODE] Returning {len(similar)} similar code items for {filename}")
+            else:
+                logger.warning(f"[SIMILAR_CODE] No similar code found for {filename}")
             
         except Exception as e:
             logger.error(f"Error finding similar code: {e}")
@@ -998,6 +1005,7 @@ class CodeAnalyzer:
         try:
             # Find entities in the file
             file_entities = self.graph_db.find_related_by_file(repo_id, filename, limit=20)
+            logger.info(f"[RELATED_CODE] Found {len(file_entities)} entities in {filename}")
             for entity in file_entities:
                 related.append(RelatedCode(
                     type="file_entity",
@@ -1016,10 +1024,10 @@ class CodeAnalyzer:
                 for caller in callers:
                     related.append(RelatedCode(
                         type="caller",
-                        file=caller["file"],
-                        name=caller["name"],
+                        file=caller.get("file", "unknown"),
+                        name=caller.get("name", "unknown"),
                         reason=f"Calls function '{func_name}'",
-                        line=caller["line"]
+                        line=caller.get("line")
                     ))
             
             # Find file-level dependencies
@@ -1027,25 +1035,25 @@ class CodeAnalyzer:
             for dep in file_deps[:5]:  # Top 5 most coupled files
                 related.append(RelatedCode(
                     type="file_dependency",
-                    file=dep["file"],
-                    name=f"{dep['call_count']} calls",
-                    reason=f"File dependency ({dep['call_count']} function calls)",
+                    file=dep.get("file", "unknown"),
+                    name=f"{dep.get('call_count', 0)} calls",
+                    reason=f"File dependency ({dep.get('call_count', 0)} function calls)",
                     line=None
                 ))
             
             # Check for complexity hotspots in this file
             complexity_issues = self.graph_db.get_complexity_hotspots(repo_id, min_calls=5, limit=10)
             for hotspot in complexity_issues:
-                if hotspot["file"] == filename:
+                if hotspot.get("file") == filename:
                     related.append(RelatedCode(
                         type="complexity_hotspot",
-                        file=hotspot["file"],
-                        name=hotspot["name"],
-                        reason=f"Complexity hotspot: {hotspot['call_count']} outgoing calls",
-                        line=hotspot["line"]
+                        file=hotspot.get("file", "unknown"),
+                        name=hotspot.get("name", "unknown"),
+                        reason=f"Complexity hotspot: {hotspot.get('call_count', 0)} outgoing calls",
+                        line=hotspot.get("line")
                     ))
             
-            logger.info(f"Found {len(related)} related code items for {filename}")
+            logger.info(f"[RELATED_CODE] Returning {len(related)} related code items for {filename}")
             
         except Exception as e:
             logger.error(f"Error finding related code: {e}")

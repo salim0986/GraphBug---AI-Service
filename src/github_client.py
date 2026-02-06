@@ -167,6 +167,18 @@ class GitHubClient:
         
         logger.info("GitHubClient initialized")
     
+    def get_installation_token(self, installation_id: int) -> str:
+        """
+        Get installation access token (public method for repo cloning)
+        
+        Args:
+            installation_id: GitHub App installation ID
+            
+        Returns:
+            str: Installation access token for git operations
+        """
+        return self.token_manager.get_installation_token(installation_id)
+    
     def _get_github_instance(self, installation_id: int) -> Github:
         """
         Get authenticated GitHub instance for installation
