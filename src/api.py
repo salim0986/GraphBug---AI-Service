@@ -36,6 +36,7 @@ from .cleanup import DataCleanup, IngestionCheckpoint
 import git
 import shutil
 import os
+import sys
 import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import time

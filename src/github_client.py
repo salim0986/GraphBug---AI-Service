@@ -65,7 +65,8 @@ class GitHubConfig:
             with open(private_key_path, 'r') as f:
                 private_key = f.read()
         elif private_key_content:
-            private_key = private_key_content
+            # Handle escaped newlines (\n -> actual newlines)
+            private_key = private_key_content.replace('\\n', '\n')
         else:
             raise ValueError("Either GITHUB_PRIVATE_KEY_PATH or GITHUB_PRIVATE_KEY must be set")
         
