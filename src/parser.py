@@ -97,16 +97,9 @@ class UniversalParser:
                 query_scm = f.read()
 
             # 4. Execute Query
-            # FIX: Use language.query() method instead of Query constructor
-            # The tree-sitter-languages library uses a different API
-            try:
-                query = language.query(query_scm)
-                captures = query.captures(tree.root_node)
-            except AttributeError:
-                # Fallback for different tree-sitter versions
-                import tree_sitter
-                query = tree_sitter.Query(language, query_scm)
-                captures = query.captures(tree.root_node)
+            # Use language.query() method (correct API for tree-sitter-languages)
+            query = language.query(query_scm)
+            captures = query.captures(tree.root_node)
             
             return captures, code_bytes
 
@@ -150,21 +143,10 @@ class UniversalParser:
             with open(query_file, "r") as f:
                 query_scm = f.read()
             
-            # 4. Execute Query
+            # 4. Execute Query  
             # Use language.query() method (correct API for tree-sitter-languages)
-            try:
-                query = language.query(query_scm)
-                captures = query.captures(tree.root_node)
-            except (AttributeError, TypeError):
-                # Fallback for older tree-sitter versions
-                import tree_sitter
-                try:
-                    query = tree_sitter.Query(language, query_scm)
-                    captures = query.captures(tree.root_node)
-                except TypeError:
-                    # tree_sitter.Query() no longer accepts arguments in newer versions
-                    logger.error(f"Tree-sitter API incompatibility for {lang_name}. Please update tree-sitter-languages.")
-                    return None, None
+            query = language.query(query_scm)
+            captures = query.captures(tree.root_node)
             
             return captures, code_bytes
         
