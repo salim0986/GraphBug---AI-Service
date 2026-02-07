@@ -1,5 +1,6 @@
 import logging
 import sys
+import os
 import json
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -56,12 +57,20 @@ def setup_logger(name: str, structured: bool = False) -> logging.Logger:
     if not logger.handlers:
         logger.setLevel(getattr(logging, LOG_LEVEL))
         
-        # Console handler
+        # Detect production environment (Hugging Face Spaces, Cloud Run, etc.)
+        is_production = os.getenv("ENVIRONMENT") == "production" or os.getenv("SPACE_ID") is not None
+        
+        # Console handler with immediate flushing for production
         handler = logging.StreamHandler(sys.stdout)
         handler.setLevel(getattr(logging, LOG_LEVEL))
         
+        # Force immediate flush in production to ensure logs are visible
+        if is_production:
+            # Set unbuffered mode
+            sys.stdout.reconfigure(line_buffering=True) if hasattr(sys.stdout, 'reconfigure') else None
+        
         # Choose formatter based on environment
-        if structured or LOG_LEVEL == "DEBUG":
+        if structured or is_production:
             # Use structured JSON logging in production
             formatter = StructuredFormatter()
         else:
@@ -73,6 +82,14 @@ def setup_logger(name: str, structured: bool = False) -> logging.Logger:
         
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+        
+        # Force flush after each log in production
+        if is_production:
+            old_emit = handler.emit
+            def flush_emit(record):
+                old_emit(record)
+                handler.flush()
+            handler.emit = flush_emit
     
     return logger
 

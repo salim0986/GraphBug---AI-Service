@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 import uuid
 import httpx
+import jwt
 from datetime import datetime, timezone
 
 # Initialize rate limiters
@@ -106,20 +107,64 @@ context_builder = ContextBuilder(code_analyzer, graph_db, vector_db)
 
 # Initialize GitHub Client (Phase 5.3)
 try:
+    logger.info("=" * 80)
+    logger.info("🔑 Initializing GitHub Client...")
+    logger.info("=" * 80)
+    sys.stdout.flush()
+    
     github_config = GitHubConfig.from_env()
     github_client = GitHubClient(github_config)
+    
+    # Test the token generation to ensure credentials are valid
+    logger.info("Testing GitHub App credentials...")
+    sys.stdout.flush()
+    
+    try:
+        # Try to generate a JWT to verify private key is valid
+        test_jwt = jwt.encode(
+            {
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 60,
+                "iss": github_config.app_id
+            },
+            github_config.private_key,
+            algorithm="RS256"
+        )
+        logger.info(f"✅ JWT generation successful ({len(test_jwt)} chars)")
+        sys.stdout.flush()
+    except Exception as jwt_error:
+        logger.error(f"❌ JWT generation failed: {jwt_error}")
+        logger.error("   This indicates the private key is invalid or malformed")
+        sys.stdout.flush()
+        raise
+    
     logger.info("=" * 80)
     logger.info("✅ GitHub Client Initialized Successfully!")
     logger.info(f"   App ID: {github_config.app_id}")
     logger.info(f"   Private key loaded: {len(github_config.private_key)} bytes")
     logger.info("   PR comments will be posted automatically")
+    logger.info("   Repository cloning will use GitHub App authentication")
     logger.info("=" * 80)
+    sys.stdout.flush()
+    
 except Exception as e:
     logger.error("=" * 80)
-    logger.error(f"❌ GitHub client initialization FAILED: {e}")
-    logger.error("   PR comments will NOT be posted!")
-    logger.error("   Set GITHUB_APP_ID and GITHUB_PRIVATE_KEY in .env file")
+    logger.error(f"❌ GITHUB CLIENT INITIALIZATION FAILED")
+    logger.error(f"   Error: {e}")
+    logger.error(f"   Error type: {type(e).__name__}")
     logger.error("=" * 80)
+    logger.error("Consequences:")
+    logger.error("  - PR comments will NOT be posted")
+    logger.error("  - Private repositories CANNOT be cloned")
+    logger.error("  - Only public repositories will work")
+    logger.error("=" * 80)
+    logger.error("Required environment variables:")
+    logger.error("  - GITHUB_APP_ID: Your GitHub App ID")
+    logger.error("  - GITHUB_PRIVATE_KEY: Your GitHub App private key (PEM format)")
+    logger.error("  - Or GITHUB_PRIVATE_KEY_PATH: Path to private key file")
+    logger.error("=" * 80)
+    logger.error("Full traceback:", exc_info=True)
+    sys.stdout.flush()
     github_client = None
 
 # Initialize LangGraph Workflow (Phase 4) with dependencies
@@ -142,7 +187,12 @@ class QueryRequest(BaseModel):
 
 def process_repo_task(req: RepoRequest):
     """The Heavy Worker Function: Clones -> Parses -> Indexes"""
-    logger.info(f"Starting processing for {req.repo_url} (ID: {req.repo_id})")
+    logger.info("=" * 80)
+    logger.info(f"🔄 STARTING FULL INGESTION")
+    logger.info(f"   Repo URL: {req.repo_url}")
+    logger.info(f"   Repo ID: {req.repo_id}")
+    logger.info("=" * 80)
+    sys.stdout.flush()
     
     # Sanitize repo_id to prevent path traversal
     try:
@@ -164,12 +214,23 @@ def process_repo_task(req: RepoRequest):
     
     try:
         logger.info(f"Cloning repository from {req.repo_url}")
+        logger.info(f"GitHub client available: {github_client is not None}")
+        sys.stdout.flush()
         
         # FIX: Use GitHub App installation token for private repo access
         if github_client:
             try:
+                logger.info(f"Attempting to get installation token for installation {req.installation_id}")
+                sys.stdout.flush()
+                
                 # Get installation access token
                 token = github_client.get_installation_token(int(req.installation_id))
+                
+                if not token or len(token) < 10:
+                    raise ValueError(f"Invalid token received: {len(token) if token else 0} chars")
+                
+                logger.info(f"✅ Successfully obtained installation token ({len(token)} chars)")
+                sys.stdout.flush()
                 
                 # Build authenticated clone URL
                 # Format: https://x-access-token:TOKEN@github.com/owner/repo.git
@@ -179,21 +240,60 @@ def process_repo_task(req: RepoRequest):
                 )
                 
                 logger.info(f"Cloning with GitHub App authentication (installation {req.installation_id})")
-                git.Repo.clone_from(auth_url, local_path)
+                sys.stdout.flush()
+                
+                # Clone with timeout to prevent hanging
+                git.Repo.clone_from(auth_url, local_path, depth=1)  # Shallow clone for speed
+                
+                logger.info(f"✅ Successfully cloned repository with authentication")
+                sys.stdout.flush()
+                
             except Exception as auth_error:
-                logger.warning(f"Failed to use GitHub App auth, trying public clone: {auth_error}")
-                # Fallback to public clone (for public repos)
-                git.Repo.clone_from(req.repo_url, local_path)
+                logger.error("=" * 80)
+                logger.error(f"❌ GITHUB APP AUTHENTICATION FAILED")
+                logger.error(f"   Installation ID: {req.installation_id}")
+                logger.error(f"   Error: {auth_error}")
+                logger.error(f"   Error type: {type(auth_error).__name__}")
+                logger.error("=" * 80)
+                logger.error("Full traceback:", exc_info=True)
+                sys.stdout.flush()
+                
+                # DO NOT fallback to public clone for private repos
+                # This will fail with "could not read Username" error
+                raise Exception(
+                    f"Failed to clone repository with GitHub App authentication. "
+                    f"This is likely a private repository. Error: {auth_error}"
+                )
         else:
-            # No GitHub client available, try public clone
-            logger.warning("GitHub client not available, attempting public clone")
-            git.Repo.clone_from(req.repo_url, local_path)
+            # No GitHub client available - only works for public repos
+            logger.error("=" * 80)
+            logger.error(f"❌ GITHUB CLIENT NOT AVAILABLE")
+            logger.error(f"   Cannot clone private repositories without GitHub App credentials")
+            logger.error(f"   Set GITHUB_APP_ID and GITHUB_PRIVATE_KEY in environment")
+            logger.error("=" * 80)
+            sys.stdout.flush()
+            
+            raise Exception(
+                "GitHub client not initialized. Cannot clone repository. "
+                "Please set GITHUB_APP_ID and GITHUB_PRIVATE_KEY environment variables."
+            )
             
     except Exception as e:
-        logger.error(f"Git Clone Failed: {e}")
+        logger.error("=" * 80)
+        logger.error(f"❌ GIT CLONE FAILED")
         logger.error(f"   Repo URL: {req.repo_url}")
         logger.error(f"   Installation ID: {req.installation_id}")
-        logger.error(f"   This usually means: 1) Private repo without token, 2) Repo doesn't exist, 3) Network issue")
+        logger.error(f"   Local path: {local_path}")
+        logger.error(f"   Error: {e}")
+        logger.error("=" * 80)
+        logger.error("Common causes:")
+        logger.error("  1. Private repo without valid GitHub App token")
+        logger.error("  2. GitHub App not installed on repository")
+        logger.error("  3. Invalid installation ID")
+        logger.error("  4. Repository doesn't exist or was deleted")
+        logger.error("  5. Network connectivity issues")
+        logger.error("=" * 80)
+        sys.stdout.flush()
         return
 
     start_time = time.time()
@@ -363,14 +463,22 @@ def process_repo_task(req: RepoRequest):
     
     # 4. Build dependencies
     logger.info(f"🔗 Building dependency graph...")
+    sys.stdout.flush()
     try:
         graph_db.build_dependencies(req.repo_id)
     except Exception as e:
         logger.error(f"Error building dependencies: {e}")
+        sys.stdout.flush()
     
     elapsed_time = time.time() - start_time
-    logger.info(f"✅ Completed in {elapsed_time:.1f}s: {file_count} files, {indexed_count} functions indexed")
-    logger.info(f"⚡ Average speed: {file_count/elapsed_time:.1f} files/sec")
+    logger.info("=" * 80)
+    logger.info(f"✅ FULL INGESTION COMPLETE")
+    logger.info(f"   Time: {elapsed_time:.1f}s")
+    logger.info(f"   Files: {file_count}")
+    logger.info(f"   Functions indexed: {indexed_count}")
+    logger.info(f"   Speed: {file_count/elapsed_time:.1f} files/sec")
+    logger.info("=" * 80)
+    sys.stdout.flush()
     
     # Cleanup
     try:
@@ -394,10 +502,21 @@ async def ingest_repo(request: Request, req: RepoRequest, background_tasks: Back
     - Full: ~10-60s depending on repo size
     - Incremental: ~2-10s for typical updates
     """
+    # Force immediate log output
+    logger.info("=" * 80)
+    logger.info(f"📥 INGESTION REQUEST RECEIVED")
+    logger.info(f"   Repo: {req.repo_url}")
+    logger.info(f"   Repo ID: {req.repo_id}")
+    logger.info(f"   Installation ID: {req.installation_id}")
+    logger.info(f"   Incremental: {req.incremental}")
+    logger.info(f"   Last Commit: {req.last_commit or 'N/A'}")
+    logger.info("=" * 80)
+    sys.stdout.flush()  # Force immediate flush
+    
     if req.incremental and req.last_commit:
         # Incremental mode - much faster!
         background_tasks.add_task(process_repo_incremental_task, req)
-        return {
+        response = {
             "status": "queued",
             "repo_id": req.repo_id,
             "mode": "incremental",
@@ -406,60 +525,112 @@ async def ingest_repo(request: Request, req: RepoRequest, background_tasks: Back
     else:
         # Full ingestion mode
         background_tasks.add_task(process_repo_task, req)
-        return {
+        response = {
             "status": "queued",
             "repo_id": req.repo_id,
             "mode": "full"
         }
+    
+    logger.info(f"✅ Ingestion queued: {response}")
+    sys.stdout.flush()  # Force immediate flush
+    return response
 
 async def process_repo_incremental_task(req: RepoRequest):
     """
     High-performance incremental ingestion
     Only processes files that changed since last_commit
     """
-    logger.info(f"Starting INCREMENTAL processing for {req.repo_url} (ID: {req.repo_id})")
+    logger.info("=" * 80)
+    logger.info(f"🔄 STARTING INCREMENTAL INGESTION")
+    logger.info(f"   Repo URL: {req.repo_url}")
+    logger.info(f"   Repo ID: {req.repo_id}")
     logger.info(f"   From commit: {req.last_commit}")
+    logger.info("=" * 80)
+    sys.stdout.flush()
     
     local_path = f"./temp_repos/{req.repo_id}"
     
     try:
         # Clone or pull repository with authentication
         if os.path.exists(local_path):
-            logger.info(f"Repository exists, pulling latest changes...")
+            logger.info(f"Repository exists locally, pulling latest changes...")
+            sys.stdout.flush()
+            
             repo = git.Repo(local_path)
             
             # Update remote URL with token if GitHub client available
             if github_client:
                 try:
+                    logger.info(f"Updating remote URL with fresh authentication token")
+                    sys.stdout.flush()
+                    
                     token = github_client.get_installation_token(int(req.installation_id))
+                    
+                    if not token or len(token) < 10:
+                        raise ValueError(f"Invalid token received: {len(token) if token else 0} chars")
+                    
                     auth_url = req.repo_url.replace(
                         "https://github.com/",
                         f"https://x-access-token:{token}@github.com/"
                     )
+                    
                     # Update remote URL
                     repo.remotes.origin.set_url(auth_url)
+                    logger.info(f"✅ Remote URL updated with authentication")
+                    sys.stdout.flush()
+                    
                 except Exception as e:
-                    logger.warning(f"Failed to update remote with auth: {e}")
+                    logger.error(f"❌ Failed to update remote with auth: {e}")
+                    sys.stdout.flush()
+                    raise
             
             origin = repo.remotes.origin
             origin.pull()
+            logger.info(f"✅ Successfully pulled latest changes")
+            sys.stdout.flush()
+            
         else:
-            logger.info(f"Cloning repository from {req.repo_url}")
+            logger.info(f"Repository not found locally, cloning from {req.repo_url}")
+            sys.stdout.flush()
             
             # Use authenticated URL for private repos
             if github_client:
                 try:
+                    logger.info(f"Obtaining installation token for cloning")
+                    sys.stdout.flush()
+                    
                     token = github_client.get_installation_token(int(req.installation_id))
+                    
+                    if not token or len(token) < 10:
+                        raise ValueError(f"Invalid token received: {len(token) if token else 0} chars")
+                    
+                    logger.info(f"✅ Token obtained ({len(token)} chars)")
+                    sys.stdout.flush()
+                    
                     auth_url = req.repo_url.replace(
                         "https://github.com/",
                         f"https://x-access-token:{token}@github.com/"
                     )
-                    git.Repo.clone_from(auth_url, local_path)
+                    
+                    git.Repo.clone_from(auth_url, local_path, depth=1)
+                    logger.info(f"✅ Successfully cloned repository with authentication")
+                    sys.stdout.flush()
+                    
                 except Exception as e:
-                    logger.warning(f"Failed to clone with auth, trying public: {e}")
-                    git.Repo.clone_from(req.repo_url, local_path)
+                    logger.error("=" * 80)
+                    logger.error(f"❌ CLONE FAILED WITH AUTHENTICATION")
+                    logger.error(f"   Installation ID: {req.installation_id}")
+                    logger.error(f"   Error: {e}")
+                    logger.error("=" * 80)
+                    sys.stdout.flush()
+                    raise
             else:
-                git.Repo.clone_from(req.repo_url, local_path)
+                logger.error("=" * 80)
+                logger.error(f"❌ GITHUB CLIENT NOT AVAILABLE")
+                logger.error(f"   Cannot clone private repositories")
+                logger.error("=" * 80)
+                sys.stdout.flush()
+                raise Exception("GitHub client not initialized")
         
         # Run incremental ingestion
         stats = await ingest_repo_incremental(
@@ -473,13 +644,24 @@ async def process_repo_incremental_task(req: RepoRequest):
             last_commit=req.last_commit
         )
         
-        logger.info(f"✅ Incremental ingestion complete: {stats}")
+        logger.info("=" * 80)
+        logger.info(f"✅ INCREMENTAL INGESTION COMPLETE")
         logger.info(f"   Files processed: {stats['files_processed']}")
+        logger.info(f"   Files deleted: {stats.get('files_deleted', 0)}")
         logger.info(f"   Nodes added: {stats['nodes_added']}")
+        logger.info(f"   Nodes deleted: {stats.get('nodes_deleted', 0)}")
         logger.info(f"   Vectors updated: {stats['vectors_updated']}")
+        logger.info("=" * 80)
+        sys.stdout.flush()
         
     except Exception as e:
-        logger.error(f"Incremental ingestion failed: {e}", exc_info=True)
+        logger.error("=" * 80)
+        logger.error(f"❌ INCREMENTAL INGESTION FAILED")
+        logger.error(f"   Repo: {req.repo_url}")
+        logger.error(f"   Error: {e}")
+        logger.error("=" * 80)
+        logger.error(f"Full traceback:", exc_info=True)
+        sys.stdout.flush()
     
     # Cleanup (optional - keep for next incremental update)
     # try:

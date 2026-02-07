@@ -66,8 +66,12 @@ class IncrementalIngester:
         Returns:
             Dict with stats: files_processed, nodes_added, nodes_deleted, vectors_updated
         """
-        logger.info(f"Starting incremental ingestion for {repo_id}")
+        logger.info("=" * 80)
+        logger.info(f"🔄 INCREMENTAL INGESTION STARTING")
+        logger.info(f"   Repo ID: {repo_id}")
+        logger.info(f"   Local path: {local_path}")
         logger.info(f"   Range: {last_commit or 'initial'} → {current_commit}")
+        logger.info("=" * 80)
         
         stats = {
             "files_processed": 0,
@@ -87,21 +91,27 @@ class IncrementalIngester:
                 )
             else:
                 # Full ingestion - process all files
+                logger.info("📁 Full ingestion mode - scanning all files...")
                 changed_files = self._get_all_files(local_path)
                 deleted_files = set()
             
-            logger.info(f"Changed files: {len(changed_files)}, Deleted files: {len(deleted_files)}")
+            logger.info(f"📊 Changed files: {len(changed_files)}, Deleted files: {len(deleted_files)}")
             
             # Process deleted files first
+            if deleted_files:
+                logger.info(f"🗑️ Processing {len(deleted_files)} deleted files...")
             for file_path in deleted_files:
                 await self._delete_file_data(repo_id, file_path)
                 stats["files_deleted"] += 1
                 stats["nodes_deleted"] += 1  # Approximate
             
             # Process changed files in parallel batches
+            if changed_files:
+                logger.info(f"⚙️ Processing {len(changed_files)} changed files in parallel batches...")
             batch_size = 10  # Parse 10 files in parallel
             for i in range(0, len(changed_files), batch_size):
                 batch = changed_files[i:i + batch_size]
+                logger.info(f"   Batch {i//batch_size + 1}/{(len(changed_files) + batch_size - 1)//batch_size}: Processing {len(batch)} files...")
                 batch_stats = await self._process_file_batch(
                     repo_id, local_path, batch
                 )
@@ -110,14 +120,26 @@ class IncrementalIngester:
                 stats["vectors_updated"] += batch_stats["vectors_updated"]
             
             # Rebuild dependencies for changed files only
-            logger.info("Rebuilding dependencies...")
+            logger.info("🔗 Rebuilding dependencies...")
             self.graph_db.build_dependencies(repo_id)
             
-            logger.info(f"✅ Incremental ingestion complete: {stats}")
+            logger.info("=" * 80)
+            logger.info(f"✅ INCREMENTAL INGESTION COMPLETE")
+            logger.info(f"   Files processed: {stats['files_processed']}")
+            logger.info(f"   Files deleted: {stats['files_deleted']}")
+            logger.info(f"   Nodes added: {stats['nodes_added']}")
+            logger.info(f"   Nodes deleted: {stats['nodes_deleted']}")
+            logger.info(f"   Vectors updated: {stats['vectors_updated']}")
+            logger.info("=" * 80)
             return stats
             
         except Exception as e:
-            logger.error(f"Incremental ingestion failed: {e}", exc_info=True)
+            logger.error("=" * 80)
+            logger.error(f"❌ INCREMENTAL INGESTION FAILED")
+            logger.error(f"   Repo ID: {repo_id}")
+            logger.error(f"   Error: {e}")
+            logger.error("=" * 80)
+            logger.error(f"Full traceback:", exc_info=True)
             raise
     
     def _get_changed_files(
