@@ -12,7 +12,7 @@
 
 (type_parameter_constraints_clause (identifier) @name) @reference.class
 
-(type_parameter_constraint (type type: (identifier) @name)) @reference.class
+
 
 (variable_declaration type: (identifier) @name) @reference.class
 

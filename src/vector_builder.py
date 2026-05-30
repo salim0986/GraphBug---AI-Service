@@ -2,13 +2,14 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, Filter, FieldCondition, MatchValue, VectorParams, Distance
 from qdrant_client.http import models
 import uuid
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from .logger import setup_logger
+from .reranker import Reranker
 
 logger = setup_logger(__name__)
 
 class VectorBuilder:
-    def __init__(self, url, model, api_key: Optional[str] = None):
+    def __init__(self, url, model, api_key: Optional[str] = None, use_reranker: bool = True):
         """
         Initialize VectorBuilder with optional API key for Qdrant Cloud.
         
@@ -26,6 +27,7 @@ class VectorBuilder:
         self.model = model
         self.embed_model = model  # Expose for batch operations
         self.collection = "repo_code"
+        self._reranker = Reranker() if use_reranker else None
 
     def ensure_collection(self):
         """
@@ -36,7 +38,7 @@ class VectorBuilder:
             if not self.client.collection_exists(self.collection):
                 self.client.create_collection(
                     collection_name=self.collection,
-                    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+                    vectors_config=VectorParams(size=768, distance=Distance.COSINE),
                 )
                 logger.info(f"Created vector collection '{self.collection}'")
                 
@@ -90,7 +92,8 @@ class VectorBuilder:
             )
         except Exception as e:
             logger.warning(f"Vector ingest error for {func_name}: {e}")    
-    def upsert_function_vector(self, repo_id, func_name, embedding, file_path, start_line, raw_code):
+    def upsert_function_vector(self, repo_id, func_name, embedding, file_path, start_line, raw_code, 
+                               language=None, parent_function=None, parent_class=None):
         """
         Upsert a vector with pre-computed embedding (for batch operations)
         
@@ -101,6 +104,9 @@ class VectorBuilder:
             file_path: File path
             start_line: Starting line number
             raw_code: Raw function code
+            language: Code language
+            parent_function: Enclosing function name
+            parent_class: Enclosing class name
         """
         try:
             # Convert numpy array to list if needed
@@ -115,7 +121,10 @@ class VectorBuilder:
                 "file": file_path,
                 "type": "function",
                 "start_line": start_line,
-                "raw_code": raw_code
+                "raw_code": raw_code,
+                "language": language,
+                "parent_function": parent_function,
+                "parent_class": parent_class
             }
             
             self.client.upsert(
@@ -127,26 +136,23 @@ class VectorBuilder:
         except Exception as e:
             logger.error(f"Vector upsert error: {e}")
 
-    def search_similar(self, repo_id, query_text, limit=5):
+    def search_similar(self, repo_id, query_text, limit=5, language=None):
         """
-        Retrieves code relevant to the query, strictly filtered by repo_id.
+        Retrieves code relevant to the query, strictly filtered by repo_id and optionally language.
         """
-        logger.debug(f"[VectorDB] search_similar: repo_id={repo_id}, query='{query_text[:50]}...', limit={limit}")
+        logger.debug(f"[VectorDB] search_similar: repo_id={repo_id}, query='{query_text[:50]}...', limit={limit}, lang={language}")
         
         try:
             query_vector = self.model.encode(query_text).tolist()
             
+            must_conditions = [FieldCondition(key="repo_id", match=MatchValue(value=repo_id))]
+            if language:
+                must_conditions.append(FieldCondition(key="language", match=MatchValue(value=language)))
+                
             result = self.client.query_points(
                 collection_name=self.collection,
                 query=query_vector,
-                query_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="repo_id",
-                            match=MatchValue(value=repo_id)
-                        )
-                    ]
-                ),
+                query_filter=Filter(must=must_conditions),
                 limit=limit
             ).points
             
@@ -183,26 +189,26 @@ class VectorBuilder:
     # ADVANCED VECTOR SEARCH FOR CODE REVIEW (Phase 3.3)
     # ========================================================================
     
-    def search_similar_code(self, repo_id: str, code_snippet: str, limit: int = 5, min_score: float = 0.7):
+    def search_similar_code(self, repo_id: str, code_snippet: str, limit: int = 5, min_score: float = 0.5, language: Optional[str] = None):
         """
         Find similar code snippets using semantic search
-        Returns code with similarity scores above threshold
+        Returns code with similarity scores above threshold, reranked if available.
         """
         try:
             query_vector = self.model.encode(code_snippet).tolist()
             
+            # Fetch more for reranking
+            fetch_limit = min(limit * 6, 50) if self._reranker else limit
+            
+            must_conditions = [FieldCondition(key="repo_id", match=MatchValue(value=repo_id))]
+            if language:
+                must_conditions.append(FieldCondition(key="language", match=MatchValue(value=language)))
+                
             results = self.client.query_points(
                 collection_name=self.collection,
                 query=query_vector,
-                query_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="repo_id",
-                            match=MatchValue(value=repo_id)
-                        )
-                    ]
-                ),
-                limit=limit,
+                query_filter=Filter(must=must_conditions),
+                limit=fetch_limit,
                 with_payload=True,
                 score_threshold=min_score
             ).points
@@ -215,10 +221,20 @@ class VectorBuilder:
                     "line": point.payload.get("start_line", 0),
                     "code": point.payload.get("raw_code", ""),
                     "similarity": float(point.score),
-                    "type": point.payload.get("type", "function")
+                    "type": point.payload.get("type", "function"),
+                    "language": point.payload.get("language"),
+                    "parent_function": point.payload.get("parent_function"),
+                    "parent_class": point.payload.get("parent_class")
                 })
             
-            logger.info(f"Found {len(similar_code)} similar code snippets (threshold: {min_score})")
+            # Apply reranking if available
+            if self._reranker and similar_code:
+                logger.debug(f"Reranking {len(similar_code)} results...")
+                similar_code = self._reranker.rerank(code_snippet, similar_code, top_k=limit)
+            else:
+                similar_code = similar_code[:limit]
+                
+            logger.info(f"Found {len(similar_code)} similar code snippets")
             return similar_code
             
         except Exception as e:
@@ -242,7 +258,7 @@ class VectorBuilder:
             logger.error(f"Error finding duplicate code: {e}")
             return []
     
-    def semantic_code_search(self, repo_id: str, natural_language_query: str, limit: int = 10):
+    def semantic_code_search(self, repo_id: str, natural_language_query: str, limit: int = 10, language: Optional[str] = None):
         """
         Search code using natural language description
         E.g., "functions that handle authentication" or "code that processes payments"
@@ -250,18 +266,17 @@ class VectorBuilder:
         try:
             query_vector = self.model.encode(natural_language_query).tolist()
             
+            fetch_limit = min(limit * 6, 50) if self._reranker else limit
+            
+            must_conditions = [FieldCondition(key="repo_id", match=MatchValue(value=repo_id))]
+            if language:
+                must_conditions.append(FieldCondition(key="language", match=MatchValue(value=language)))
+                
             results = self.client.query_points(
                 collection_name=self.collection,
                 query=query_vector,
-                query_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="repo_id",
-                            match=MatchValue(value=repo_id)
-                        )
-                    ]
-                ),
-                limit=limit,
+                query_filter=Filter(must=must_conditions),
+                limit=fetch_limit,
                 with_payload=True
             ).points
             
@@ -273,9 +288,15 @@ class VectorBuilder:
                     "line": point.payload.get("start_line", 0),
                     "code": point.payload.get("raw_code", ""),
                     "relevance": float(point.score),
-                    "type": point.payload.get("type", "function")
+                    "type": point.payload.get("type", "function"),
+                    "language": point.payload.get("language")
                 })
             
+            if self._reranker and matches:
+                matches = self._reranker.rerank(natural_language_query, matches, top_k=limit)
+            else:
+                matches = matches[:limit]
+                
             logger.info(f"Semantic search found {len(matches)} matches for: '{natural_language_query}'")
             return matches
             

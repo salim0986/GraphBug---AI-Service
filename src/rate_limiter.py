@@ -159,38 +159,48 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         else:
             return "default"
     
-    def _get_installation_id(self, request: Request) -> str:
-        """Extract installation ID from request"""
-        # Try query parameter
-        installation_id = request.query_params.get("installation_id")
-        if installation_id:
-            return installation_id
-        
-        # Try request body (if POST/PUT)
-        if hasattr(request.state, "body"):
-            body = request.state.body
-            if isinstance(body, dict):
-                installation_id = body.get("installation_id")
-                if installation_id:
-                    return installation_id
-        
-        # Try headers
-        installation_id = request.headers.get("X-Installation-ID")
-        if installation_id:
-            return installation_id
-        
+    async def _get_rate_limit_key(self, request: Request) -> str:
+        """
+        Return the rate-limit key for this request.
+        Keys by installation_id when available, falls back to IP.
+        M12: reads POST body (cached by Starlette) to extract installation_id.
+        """
+        # Query parameter
+        iid = request.query_params.get("installation_id")
+        if iid:
+            return f"inst:{iid}"
+
+        # Header
+        iid = request.headers.get("X-Installation-ID")
+        if iid:
+            return f"inst:{iid}"
+
+        # POST/PUT body — Starlette caches body after first read
+        if request.method in ("POST", "PUT", "PATCH"):
+            try:
+                import json as _json
+                body_bytes = await request.body()
+                if body_bytes:
+                    body_data = _json.loads(body_bytes)
+                    iid = str(body_data.get("installation_id", ""))
+                    if iid:
+                        return f"inst:{iid}"
+            except Exception:
+                pass
+
         # Fallback to IP address
-        return request.client.host if request.client else "anonymous"
-    
+        ip = request.client.host if request.client else "anonymous"
+        return f"ip:{ip}"
+
     async def dispatch(self, request: Request, call_next):
         """Process request through rate limiter"""
-        
+
         # Skip rate limiting for health checks and docs
         if request.url.path in ["/health", "/", "/docs", "/openapi.json"]:
             return await call_next(request)
-        
+
         endpoint_type = self._get_endpoint_type(request.url.path)
-        installation_id = self._get_installation_id(request)
+        installation_id = await self._get_rate_limit_key(request)
         
         # Check rate limit
         allowed, error_msg = self.limiter.check_rate_limit(

@@ -1,5 +1,6 @@
 import sys
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -53,6 +54,33 @@ app = FastAPI(title="Graph Bug AI Service", version="2.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# M10: OpenTelemetry instrumentation (no-op when packages are absent)
+from .observability import setup_otel as _setup_otel
+_setup_otel(app)
+
+
+# ---------------------------------------------------------------------------
+# M12: service-to-service HMAC auth (logic lives in hmac_auth.py)
+# ---------------------------------------------------------------------------
+
+from .hmac_auth import verify_service_hmac as _verify_service_hmac, HMAC_PROTECTED_PREFIXES as _HMAC_PROTECTED
+
+
+@app.middleware("http")
+async def _service_auth_middleware(request: Request, call_next):
+    """Reject requests to protected endpoints that lack a valid HMAC signature."""
+    secret = os.getenv("AI_SERVICE_SECRET", "")
+    if secret and any(request.url.path.startswith(p) for p in _HMAC_PROTECTED):
+        body_bytes = await request.body()  # Starlette caches this in request._body
+        sig = request.headers.get("X-Service-Signature", "")
+        if not _verify_service_hmac(body_bytes, sig, secret):
+            logger.warning(
+                f"[M12] Invalid service signature on {request.url.path} "
+                f"from {request.client}"
+            )
+            return JSONResponse({"error": "invalid_service_signature"}, status_code=401)
+    return await call_next(request)
+
 logger = setup_logger(__name__)
 
 # Configure CORS
@@ -69,16 +97,45 @@ app.add_middleware(
 # Add advanced rate limiting middleware
 app.add_middleware(RateLimitMiddleware, limiter=advanced_limiter)
 
+
+# M10: request_id middleware — propagates X-Request-ID through every request
+@app.middleware("http")
+async def _request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 @app.on_event("startup")
 async def startup_event():
-    """Log service status on startup"""
+    """Log service status on startup."""
     logger.info("=" * 80)
     logger.info("🚀 Graph Bug AI Service Starting...")
     logger.info(f"   Version: 2.0.0")
     logger.info(f"   GitHub Client: {'✅ Ready' if github_client else '❌ Not configured'}")
     logger.info(f"   Rate Limiting: ✅ Enabled")
     logger.info(f"   Data Cleanup: ✅ Enabled")
+    # Fix #10: warn clearly when service-to-service auth is not configured.
+    if not os.getenv("AI_SERVICE_SECRET"):
+        logger.warning(
+            "[M12] AI_SERVICE_SECRET is not set — service-to-service HMAC auth is DISABLED. "
+            "Set this in production to prevent unauthenticated review triggers."
+        )
     logger.info("=" * 80)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Flush LangFuse traces so they are not lost on SIGTERM."""
+    from .observability import get_langfuse
+    lf = get_langfuse()
+    if lf:
+        try:
+            lf.flush()
+            logger.info("[M10] LangFuse traces flushed on shutdown")
+        except Exception as exc:
+            logger.warning(f"[M10] LangFuse flush failed: {exc}")
 
 # --- CONFIGURATION ---
 
@@ -821,8 +878,11 @@ class PRReviewWebhookRequest(BaseModel):
     pull_request_id: Optional[str] = None  # Optional - will be created if not provided
     repo_db_id: Optional[str] = None  # Repository UUID from frontend database
     context: Optional[Any] = None  # Optional - will be fetched if not provided
-    gemini_api_key: Optional[str] = None  # User's Gemini API key (BYO system)
-    
+    gemini_api_key: Optional[str] = None  # Legacy — kept for backward compat
+    # M7: provider-agnostic BYO-key fields; take precedence over gemini_api_key
+    api_key: Optional[str] = None
+    provider: Optional[str] = "gemini"   # gemini|anthropic|openai|mistral|ollama
+
     class Config:
         extra = "allow"  # Allow extra fields
 
@@ -876,6 +936,7 @@ async def process_pr_review_webhook(http_request: Request, request: PRReviewWebh
                     "files": pr_data["files"],
                     "base_ref": pr_data["base"]["ref"],
                     "head_ref": pr_data["head"]["ref"],
+                    "head_sha": pr_data["head"]["sha"],  # M12: needed for inline comments
                     "additions": pr_data["additions"],
                     "deletions": pr_data["deletions"],
                     "changed_files": pr_data["changed_files"],
@@ -912,6 +973,11 @@ async def process_pr_review_webhook(http_request: Request, request: PRReviewWebh
         base_ref = context.get("base_ref", "main")
         head_ref = context.get("head_ref", "unknown")
         
+        # Propagate request_id set by the middleware
+        request_id = getattr(http_request.state, "request_id", str(uuid.uuid4()))
+
+        head_sha = context.get("head_sha", "")
+
         # Queue the review workflow as a background task
         background_tasks.add_task(
             execute_review_task,
@@ -922,11 +988,15 @@ async def process_pr_review_webhook(http_request: Request, request: PRReviewWebh
             files=files,
             base_ref=base_ref,
             head_ref=head_ref,
+            head_sha=head_sha,
             installation_id=request.installation_id,
             pull_request_db_id=request.pull_request_id,
             owner=request.owner,
             repo=request.repo,
-            gemini_api_key=request.gemini_api_key
+            gemini_api_key=request.gemini_api_key,
+            api_key=request.api_key,
+            provider=request.provider,
+            request_id=request_id,
         )
         
         # Return immediately with queued status
@@ -984,8 +1054,8 @@ async def store_review_in_database(
         # Calculate execution time
         execution_time_ms = int((end_time - start_time) * 1000) if (start_time and end_time) else 0
         
-        # Calculate total cost (dummy values for now, should come from Gemini client)
-        total_cost = 0.0
+        # M10: use real cost/token stats injected by execute_review_task
+        total_cost = float(final_state.get("total_cost", 0.0))
         
         # Determine primary model
         model = route_decision.get("model", "gemini-2.5-flash")
@@ -999,6 +1069,8 @@ async def store_review_in_database(
             "completed_at": completed_at,
             "primary_model": primary_model,
             "total_cost": total_cost,
+            "total_tokens_input": int(final_state.get("total_tokens_input", 0)),
+            "total_tokens_output": int(final_state.get("total_tokens_output", 0)),
             "execution_time_ms": execution_time_ms,
             "summary": {
                 "overallScore": 85,  # Could be calculated from issues/suggestions ratio
@@ -1212,34 +1284,56 @@ async def execute_review_task(
     pull_request_db_id: str,
     owner: str,
     repo: str,
-    gemini_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None,
+    # M7: provider-agnostic BYO-key fields (take precedence over gemini_api_key)
+    api_key: Optional[str] = None,
+    provider: Optional[str] = "gemini",
+    # M10: request_id for end-to-end log correlation
+    request_id: str = "",
+    # M12: head commit SHA for inline comment placement
+    head_sha: str = "",
 ):
     """
     Background task that executes the complete review workflow
-    
+
     This is where the actual AI review happens:
     1. Run LangGraph workflow
     2. Generate review using Gemini
     3. Post results to GitHub PR
     """
     try:
-        logger.info(f"🚀 Starting review workflow for PR #{pr_number} in {repo_id}")
+        if request_id:
+            logger.info(f"🚀 Starting review workflow for PR #{pr_number} in {repo_id} [request_id={request_id}]")
+        else:
+            logger.info(f"🚀 Starting review workflow for PR #{pr_number} in {repo_id}")
         
         # Track start time for analytics
         start_time = time.time()
         
-        # Create user-specific workflow with their Gemini API key
-        if gemini_api_key:
+        # M7: resolve the effective key and provider.
+        # api_key (new) takes precedence over legacy gemini_api_key.
+        effective_key = api_key or gemini_api_key
+        effective_provider = provider or "gemini"
+        llm_client = None  # M10: track for usage stats
+
+        if effective_key:
             from .gemini_client import create_gemini_client
-            user_gemini_client = create_gemini_client(api_key=gemini_api_key)
+            from .llm_client import LLMClient, LLMConfig
+
+            user_gemini_client = create_gemini_client(api_key=effective_key)
+            llm_client = LLMClient(LLMConfig(
+                provider=effective_provider,
+                api_key=effective_key,
+            ))
+            user_gemini_client.set_llm_client(llm_client)
             user_workflow = create_review_workflow(
                 context_builder=context_builder,
-                gemini_client=user_gemini_client
+                gemini_client=user_gemini_client,
             )
-            logger.info("✅ Using user's Gemini API key for review")
+            logger.info(f"✅ Using user's {effective_provider} API key for review")
         else:
             user_workflow = review_workflow
-            logger.info("⚠️ Using default Gemini API key (fallback)")
+            logger.info("⚠️ Using default API key (fallback)")
         
         # Execute the LangGraph workflow
         final_state = await user_workflow.run_review(
@@ -1249,13 +1343,22 @@ async def execute_review_task(
             pr_description=pr_description,
             files=files,
             base_ref=base_ref,
-            head_ref=head_ref
+            head_ref=head_ref,
+            github_client=github_client,
+            installation_id=int(installation_id) if installation_id else None
         )
         
         # Track end time
         end_time = time.time()
         final_state["start_time"] = start_time
         final_state["end_time"] = end_time
+
+        # M10: inject LLM cost/token stats so store_review_in_database can record them
+        if llm_client is not None:
+            _usage = llm_client.get_usage_stats()
+            final_state["total_cost"] = _usage["total_cost"]
+            final_state["total_tokens_input"] = _usage["tokens_in"]
+            final_state["total_tokens_output"] = _usage["tokens_out"]
         
         logger.info(f"✅ Review workflow completed for PR #{pr_number}")
         logger.info(f"   Status: {final_state.get('status')}")
@@ -1306,6 +1409,19 @@ async def execute_review_task(
                     github_comment_id=result['id'],
                     github_comment_url=result['html_url']
                 )
+
+                # M12: post inline diff comments from structured findings
+                if head_sha:
+                    from .review_poster import post_review_inline_comments
+                    inline_count = await post_review_inline_comments(
+                        github_client=github_client,
+                        repo_full_name=repo_full_name,
+                        pr_number=pr_number,
+                        head_sha=head_sha,
+                        installation_id=int(installation_id),
+                        final_state=final_state,
+                    )
+                    logger.info(f"[M12] {inline_count} inline comment(s) posted")
                 
             except Exception as e:
                 logger.error("=" * 80)

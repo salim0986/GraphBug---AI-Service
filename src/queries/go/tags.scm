@@ -47,15 +47,12 @@
             ; the identifier so they get distinct ranges.
             (var_spec
                 name: (identifier) @name @item)
-            (var_spec_list
-                (var_spec
-                    name: (identifier) @name @item)
-            )
+
         ]
      )
 )
 
-(method_elem
+(method_spec
     name: (_) @name
     parameters: (parameter_list
       "(" @context

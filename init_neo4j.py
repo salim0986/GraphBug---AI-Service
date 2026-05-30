@@ -47,8 +47,18 @@ def initialize_neo4j(uri: str, user: str, password: str):
                  "Function.file index"),
                 
                 # Variable index
-                ("CREATE INDEX variable_name_index IF NOT EXISTS FOR (v:Variable) ON (v.name)", 
+                ("CREATE INDEX variable_name_index IF NOT EXISTS FOR (v:Variable) ON (v.name)",
                  "Variable.name index"),
+
+                # M4: indexes for AST-driven edge resolution
+                ("CREATE INDEX entity_name_repo IF NOT EXISTS FOR (e:Entity) ON (e.repo_id, e.name)",
+                 "Entity.(repo_id,name) composite index"),
+                ("CREATE INDEX entity_name_file IF NOT EXISTS FOR (e:Entity) ON (e.file, e.name)",
+                 "Entity.(file,name) composite index"),
+                ("CREATE INDEX external_uid IF NOT EXISTS FOR (e:External) ON (e.uid)",
+                 "External.uid index"),
+                ("CREATE INDEX module_uid IF NOT EXISTS FOR (m:Module) ON (m.uid)",
+                 "Module.uid index"),
             ]
             
             for query, description in indexes:

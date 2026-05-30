@@ -17,6 +17,8 @@ from .temporary_graph import TemporaryGraphBuilder, TemporaryVectorBuilder
 from .context_merger import ContextMerger
 from .parser import UniversalParser, detect_language_from_filename
 from .review_validator import ReviewValidator
+from .review_formatter import ReviewFormatter
+from .review_schema import ReviewOutput, CritiqueOutput, CritiqueFinding
 from sentence_transformers import SentenceTransformer
 
 logger = setup_logger(__name__)
@@ -43,6 +45,8 @@ class ReviewState(TypedDict):
     
     # Input Data
     files: List[Dict[str, Any]]  # Raw file changes from GitHub
+    github_client: NotRequired[Any] # Client for fetching full file contents
+    installation_id: NotRequired[int] # GitHub app installation ID
     
     # Context (from Phase 3)
     pr_context: NotRequired[Dict[str, Any]]  # PRContext from context_builder
@@ -59,8 +63,20 @@ class ReviewState(TypedDict):
     low_priority_files: NotRequired[List[str]]
     
     # Review Generation
-    file_reviews: NotRequired[Dict[str, Dict[str, Any]]]  # filename -> review
+    file_reviews: NotRequired[Dict[str, Any]]
+    review_summary: NotRequired[Dict[str, Any]]
     overall_summary: NotRequired[str]
+    
+    # M6: structured review output (ReviewOutput.model_dump())
+    structured_review: NotRequired[Dict[str, Any]]
+    # M8: critique + revised review from reflect/revise nodes
+    critique: NotRequired[Dict[str, Any]]
+    revised_review: NotRequired[Dict[str, Any]]
+    # M8: was LLM-assisted routing used for this PR?
+    llm_route_used: NotRequired[bool]
+
+    # Execution metrics
+    parse_failure_total: NotRequired[int]  # gemini-2.5-flash-lite, flash, or pro
     
     # Model Selection
     selected_model: NotRequired[str]  # gemini-2.5-flash-lite, flash, or pro
@@ -165,13 +181,16 @@ class CodeReviewWorkflow:
         workflow.add_node("review_quick", self._review_quick_node)
         workflow.add_node("review_standard", self._review_standard_node)
         workflow.add_node("review_deep", self._review_deep_node)
+        # M8: reflect + revise nodes inserted between review and aggregate
+        workflow.add_node("reflect", self._reflect_node)
+        workflow.add_node("revise", self._revise_node)
         workflow.add_node("aggregate", self._aggregate_node)
         workflow.add_node("handle_error", self._error_handler_node)
-        
+
         # Define edges
         workflow.add_edge(START, "analyze")
         workflow.add_edge("analyze", "route")
-        
+
         # Conditional edges from route node
         workflow.add_conditional_edges(
             "route",
@@ -183,15 +202,17 @@ class CodeReviewWorkflow:
                 "error": "handle_error"
             }
         )
-        
-        # All review nodes go to aggregate
-        workflow.add_edge("review_quick", "aggregate")
-        workflow.add_edge("review_standard", "aggregate")
-        workflow.add_edge("review_deep", "aggregate")
-        
+
+        # M8: all review nodes → reflect → revise → aggregate
+        workflow.add_edge("review_quick", "reflect")
+        workflow.add_edge("review_standard", "reflect")
+        workflow.add_edge("review_deep", "reflect")
+        workflow.add_edge("reflect", "revise")
+        workflow.add_edge("revise", "aggregate")
+
         # Aggregate goes to END
         workflow.add_edge("aggregate", END)
-        
+
         # Error handler can retry or end
         workflow.add_conditional_edges(
             "handle_error",
@@ -220,24 +241,31 @@ class CodeReviewWorkflow:
         """Lazy load embedding model for temporary vectors"""
         if self._embed_model is None:
             logger.info("[TempGraphRAG] Loading sentence-transformers model...")
-            self._embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+            self._embed_model = SentenceTransformer('jina-embeddings-v2-base-code', trust_remote_code=True)
         return self._embed_model
     
     async def _build_temporary_graphrag(
         self,
         pr_files: List[Dict[str, Any]],
-        github_client: Optional[Any] = None
-    ) -> tuple[Optional[TemporaryGraphBuilder], Optional[TemporaryVectorBuilder]]:
+        repo_full_name: str,
+        head_sha: str,
+        github_client: Optional[Any] = None,
+        installation_id: Optional[int] = None
+    ) -> tuple[Optional[TemporaryGraphBuilder], Optional[TemporaryVectorBuilder], int]:
         """
         Build temporary in-memory GraphRAG for PR files
         
         Args:
             pr_files: List of file dicts with filename, status, patch, etc.
+            repo_full_name: Full repository name
+            head_sha: The commit SHA for the PR head
             github_client: Optional GitHub client to fetch full file content
+            installation_id: Installation ID for fetching file contents
             
         Returns:
-            Tuple of (temp_graph, temp_vector) or (None, None) on error
+            Tuple of (temp_graph, temp_vector, parse_failures) or (None, None, 0) on error
         """
+        parse_failures = 0
         try:
             logger.info(f"[TempGraphRAG] Building temporary GraphRAG for {len(pr_files)} files")
             
@@ -270,26 +298,45 @@ class CodeReviewWorkflow:
                         logger.warning(f"[TempGraphRAG] Unsupported language for {filename}, skipping")
                         continue
                     
-                    # For new/modified files, try to reconstruct full content from patch
-                    # If patch is incomplete, we could fetch from GitHub API
-                    # For now, use patch as best-effort content
+                    # For new/modified files, fetch full content from GitHub API
+                    content = ""
                     
-                    # Extract code lines from patch (remove diff markers)
-                    code_lines = []
-                    for line in patch.split('\n'):
-                        if line.startswith('+') and not line.startswith('+++'):
-                            code_lines.append(line[1:])  # Remove + prefix
-                        elif line.startswith(' '):
-                            code_lines.append(line[1:])  # Context line
+                    if github_client and installation_id and head_sha:
+                        try:
+                            # Use await since get_file_content is an async method
+                            content = await github_client.get_file_content(
+                                repo_full_name=repo_full_name,
+                                path=filename,
+                                ref=head_sha,
+                                installation_id=installation_id
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                f"[TempGraphRAG] Failed to fetch full content for {filename}: {e}",
+                                extra={"repo": repo_full_name, "path": filename, "sha": head_sha, "reason": str(e)}
+                            )
                     
-                    content = '\n'.join(code_lines)
+                    # Fallback to diff patch if fetching failed or client unavailable
+                    if not content and patch:
+                        logger.warning(f"[TempGraphRAG] Falling back to patch extraction for {filename}")
+                        code_lines = []
+                        for line in patch.split('\n'):
+                            if line.startswith('+') and not line.startswith('+++'):
+                                code_lines.append(line[1:])  # Remove + prefix
+                            elif line.startswith(' '):
+                                code_lines.append(line[1:])  # Context line
+                        content = '\n'.join(code_lines)
                     
                     if not content.strip():
                         logger.warning(f"[TempGraphRAG] No content for {filename}, skipping")
+                        parse_failures += 1
                         continue
                     
                     # Process file with tree-sitter
                     file_node = temp_graph.process_file(filename, content, language)
+                    
+                    if not file_node or not file_node.nodes:
+                        parse_failures += 1
                     
                     # Add nodes to vector index
                     if file_node.nodes:
@@ -306,14 +353,14 @@ class CodeReviewWorkflow:
             logger.info(
                 f"[TempGraphRAG] Built temporary GraphRAG: "
                 f"{processed_count} files, {len(temp_graph.nodes)} nodes, "
-                f"{len(temp_vector.vectors)} vectors"
+                f"{len(temp_vector.vectors)} vectors, {parse_failures} failures"
             )
             
-            return temp_graph, temp_vector
+            return temp_graph, temp_vector, parse_failures
             
         except Exception as e:
             logger.error(f"[TempGraphRAG] Error building temporary GraphRAG: {e}", exc_info=True)
-            return None, None
+            return None, None, 0
     
     # ========================================================================
     # NODE IMPLEMENTATIONS (Placeholders for Phase 4.1)
@@ -347,7 +394,14 @@ class CodeReviewWorkflow:
             # STEP 1: Build Temporary GraphRAG for PR Files
             # ==================================================================
             logger.info("[ANALYZE] Step 1: Building temporary in-memory GraphRAG")
-            temp_graph, temp_vector = await self._build_temporary_graphrag(state["files"])
+            temp_graph, temp_vector, parse_failures = await self._build_temporary_graphrag(
+                pr_files=state["files"],
+                repo_full_name=state["repo_id"],
+                head_sha=state.get("head_ref", ""),
+                github_client=state.get("github_client"),
+                installation_id=state.get("installation_id")
+            )
+            state["parse_failure_total"] = parse_failures
             
             # Create context merger
             context_merger = ContextMerger(temp_graph=temp_graph, temp_vector=temp_vector)
@@ -556,8 +610,10 @@ class CodeReviewWorkflow:
                 strategy = "deep"
             
             else:
-                strategy = "standard"
-            
+                # M8: borderline "standard" PRs get an LLM-assisted routing decision
+                strategy = await self._llm_route_standard(state)
+                state["llm_route_used"] = True
+
             state["review_strategy"] = strategy
             
             # Select Gemini model based on strategy and PR characteristics
@@ -640,34 +696,31 @@ class CodeReviewWorkflow:
             )
             
             model = state.get("selected_model", self.config.flash_lite_model)
-            
-            # Generate review
-            review = await self.gemini_client.generate_review(
+
+            # M6: structured generation + citation validation
+            review_output: ReviewOutput = await self.gemini_client.generate_structured_review(
                 model_name=model,
-                prompt=prompt
+                prompt=prompt,
             )
-            
-            # Validate GraphRAG usage
-            validation_result = self._validate_graphrag_usage(review, state)
-            state["graphrag_validation"] = validation_result
-            
-            # Store review
-            state["overall_summary"] = review
+            valid_uids = self._collect_entity_uids(state)
+            review_output = self.review_validator.validate_graph_citations(review_output, valid_uids)
+
+            markdown = ReviewFormatter().format_structured_review(review_output)
+            state["structured_review"] = review_output.model_dump()
+            state["overall_summary"] = markdown
             state["processed_files"] = pr_context.get("total_files", 0)
-            
+
+            unverified = sum(1 for f in review_output.findings if not f.verified)
             logger.info(
-                f"Quick review completed ({len(review)} chars, "
-                f"GraphRAG utilization: {validation_result['graphrag_utilization']:.1f}%)"
+                f"Quick review completed ({len(markdown)} chars, "
+                f"{len(review_output.findings)} findings, {unverified} unverified)"
             )
-            
-            if validation_result["issues"]:
-                logger.warning(
-                    f"[GRAPHRAG_VALIDATION] Quick review has {len(validation_result['issues'])} GraphRAG issues"
-                )
-            
             state["messages"].append({
                 "role": "assistant",
-                "content": f"Quick review generated for {pr_context.get('total_files', 0)} files (GraphRAG: {validation_result['graphrag_utilization']:.1f}%)"
+                "content": (
+                    f"Quick review generated for {pr_context.get('total_files', 0)} files "
+                    f"({len(review_output.findings)} findings, {unverified} unverified citations)"
+                ),
             })
             
         except Exception as e:
@@ -794,34 +847,32 @@ class CodeReviewWorkflow:
             )
             
             model = state.get("selected_model", self.config.pro_model)
-            
-            # Generate deep review (may take longer)
-            logger.info(f"Generating deep review with {model}...")
-            review = await self.gemini_client.generate_review(
+
+            # M6: structured generation + citation validation
+            logger.info(f"Generating structured deep review with {model}...")
+            review_output: ReviewOutput = await self.gemini_client.generate_structured_review(
                 model_name=model,
-                prompt=prompt
+                prompt=prompt,
             )
-            
-            # Validate GraphRAG usage
-            validation_result = self._validate_graphrag_usage(review, state)
-            state["graphrag_validation"] = validation_result
-            
-            state["overall_summary"] = review
+            valid_uids = self._collect_entity_uids(state)
+            review_output = self.review_validator.validate_graph_citations(review_output, valid_uids)
+
+            markdown = ReviewFormatter().format_structured_review(review_output)
+            state["structured_review"] = review_output.model_dump()
+            state["overall_summary"] = markdown
             state["processed_files"] = len(files)
-            
+
+            unverified = sum(1 for f in review_output.findings if not f.verified)
             logger.info(
-                f"Deep review completed ({len(review)} chars, "
-                f"GraphRAG utilization: {validation_result['graphrag_utilization']:.1f}%)"
+                f"Deep review completed ({len(markdown)} chars, "
+                f"{len(review_output.findings)} findings, {unverified} unverified)"
             )
-            
-            if validation_result["issues"]:
-                logger.warning(
-                    f"[GRAPHRAG_VALIDATION] Deep review has {len(validation_result['issues'])} GraphRAG issues"
-                )
-            
             state["messages"].append({
                 "role": "assistant",
-                "content": f"Deep review generated with comprehensive analysis (GraphRAG: {validation_result['graphrag_utilization']:.1f}%)"
+                "content": (
+                    f"Deep review generated with comprehensive analysis "
+                    f"({len(review_output.findings)} findings, {unverified} unverified citations)"
+                ),
             })
             
         except Exception as e:
@@ -883,34 +934,40 @@ class CodeReviewWorkflow:
             )
             
             model = state.get("selected_model", self.config.flash_model)
-            
-            # Generate aggregated review
-            logger.info("Generating aggregated review...")
-            aggregated_review = await self.gemini_client.generate_review(
+
+            # M6: structured aggregation + citation validation
+            logger.info("Generating structured aggregated review...")
+            review_output: ReviewOutput = await self.gemini_client.generate_structured_review(
                 model_name=model,
-                prompt=prompt
+                prompt=prompt,
             )
+            valid_uids = self._collect_entity_uids(state)
+            review_output = self.review_validator.validate_graph_citations(review_output, valid_uids)
+
+            markdown = ReviewFormatter().format_structured_review(review_output)
+            state["structured_review"] = review_output.model_dump()
+            state["overall_summary"] = markdown
+            state["review_summary"] = {
+                "total_issues": sum(len(f.get("issues", [])) for f in file_reviews.values()),
+                "total_suggestions": sum(1 for f in file_reviews.values() for i in f.get("issues", []) if i.get("category") == "suggestion"),
+                "critical_count": sum(1 for f in file_reviews.values() for i in f.get("issues", []) if i.get("severity") == "critical"),
+                "high_count": sum(1 for f in file_reviews.values() for i in f.get("issues", []) if i.get("severity") == "high"),
+                "medium_count": sum(1 for f in file_reviews.values() for i in f.get("issues", []) if i.get("severity") == "medium"),
+                "low_count": sum(1 for f in file_reviews.values() for i in f.get("issues", []) if i.get("severity") == "low"),
+                "parse_failure_total": state.get("parse_failure_total", 0)
+            }
             
-            # Validate GraphRAG usage in aggregated review
-            validation_result = self._validate_graphrag_usage(aggregated_review, state)
-            state["graphrag_validation"] = validation_result
-            
-            if validation_result["issues"]:
-                logger.warning(
-                    f"[GRAPHRAG_VALIDATION] Review has {len(validation_result['issues'])} GraphRAG usage issues. "
-                    f"Utilization: {validation_result['graphrag_utilization']:.1f}%"
-                )
-            
-            state["overall_summary"] = aggregated_review
-            
+            unverified = sum(1 for f in review_output.findings if not f.verified)
             logger.info(
-                f"Aggregation completed ({len(aggregated_review)} chars, "
-                f"GraphRAG utilization: {validation_result['graphrag_utilization']:.1f}%)"
+                f"Aggregation completed ({len(markdown)} chars, "
+                f"{len(review_output.findings)} findings, {unverified} unverified)"
             )
-            
             state["messages"].append({
                 "role": "assistant",
-                "content": f"Final review aggregated from individual file reviews (GraphRAG: {validation_result['graphrag_utilization']:.1f}%)"
+                "content": (
+                    f"Final review aggregated from individual file reviews "
+                    f"({len(review_output.findings)} findings, {unverified} unverified citations)"
+                ),
             })
             
         except Exception as e:
@@ -1123,12 +1180,16 @@ class CodeReviewWorkflow:
                 diff=formatted_diff
             )
             
-            review_text = await self.gemini_client.generate_review(
+            # M6: structured file review + citation validation
+            review_output: ReviewOutput = await self.gemini_client.generate_structured_review(
                 model_name=model,
-                prompt=prompt
+                prompt=prompt,
             )
-            
-            # Phase 4: Validate review against actual diff
+            valid_uids = self._collect_entity_uids(state)
+            review_output = self.review_validator.validate_graph_citations(review_output, valid_uids)
+            review_text = ReviewFormatter().format_structured_review(review_output)
+
+            # Phase 4: Validate rendered review text against actual diff
             files_for_validation = [{
                 "filename": filename,
                 "patch": diff
@@ -1206,52 +1267,50 @@ class CodeReviewWorkflow:
     async def _generate_fallback_review(self, state: ReviewState) -> ReviewState:
         """Generate basic review from context when Gemini fails"""
         logger.info("Generating fallback review from context")
-        
         try:
-            pr_context = state.get("pr_context", {})
-            
-            # Build basic review from analyzed context
-            critical_issues = pr_context.get("critical_issues", [])
-            high_issues = pr_context.get("high_issues", [])
-            recommendations = pr_context.get("recommendations", [])
-            
-            fallback_review = f"""# Code Review Summary
-
+            pr_context = state.get("pr_context")
+            if pr_context:
+                # Build basic review from analyzed context
+                critical_issues = getattr(pr_context, "critical_issues", [])
+                high_issues = getattr(pr_context, "high_issues", [])
+                recommendations = getattr(pr_context, "recommendations", [])
+                
+                fallback_review = f"""# Code Review Summary
+    
 **Note:** This is an automated summary generated from static analysis. Full AI review could not be completed.
-
+    
 ## Overview
-- **Files Changed:** {pr_context.get('total_files', 0)}
-- **Lines Changed:** +{pr_context.get('total_additions', 0)} -{pr_context.get('total_deletions', 0)}
-- **Risk Level:** {pr_context.get('risk_level', 'unknown').upper()}
-
+- **Files Changed:** {getattr(pr_context, 'total_files', 0)}
+- **Lines Changed:** +{getattr(pr_context, 'total_additions', 0)} -{getattr(pr_context, 'total_deletions', 0)}
+- **Risk Level:** {getattr(pr_context, 'risk_level', 'unknown').upper()}
+    
 ## Critical Issues ({len(critical_issues)})
 """
-            
-            for issue in critical_issues[:5]:
-                fallback_review += f"\n- ⚠️ **{issue.get('file')}** (line {issue.get('line', '?')}): {issue.get('description', '')}"
-            
-            if len(critical_issues) > 5:
-                fallback_review += f"\n- ... and {len(critical_issues) - 5} more"
-            
-            fallback_review += f"\n\n## High Priority Issues ({len(high_issues)})\n"
-            
-            for issue in high_issues[:5]:
-                fallback_review += f"\n- ⚠️ **{issue.get('file')}**: {issue.get('description', '')}"
-            
-            if len(high_issues) > 5:
-                fallback_review += f"\n- ... and {len(high_issues) - 5} more"
-            
-            fallback_review += "\n\n## Recommendations\n"
-            
-            for rec in recommendations:
-                fallback_review += f"\n- {rec}"
-            
-            state["overall_summary"] = fallback_review
-            state["status"] = "completed_with_fallback"
-            state["completed_at"] = datetime.utcnow().isoformat()
-            
-            logger.info("Fallback review generated successfully")
-            
+                
+                for issue in critical_issues[:5]:
+                    fallback_review += f"\n- ⚠️ **{issue.get('file', 'unknown')}** (line {issue.get('line', '?')}): {issue.get('description', '')}"
+                
+                if len(critical_issues) > 5:
+                    fallback_review += f"\n- ... and {len(critical_issues) - 5} more"
+                
+                fallback_review += f"\n\n## High Priority Issues ({len(high_issues)})\n"
+                
+                for issue in high_issues[:5]:
+                    fallback_review += f"\n- ⚠️ **{issue.get('file', 'unknown')}**: {issue.get('description', '')}"
+                
+                if len(high_issues) > 5:
+                    fallback_review += f"\n- ... and {len(high_issues) - 5} more"
+                
+                fallback_review += "\n\n## Recommendations\n"
+                
+                for rec in recommendations:
+                    fallback_review += f"\n- {rec}"
+                
+                state["overall_summary"] = fallback_review
+                state["status"] = "completed_with_fallback"
+                state["completed_at"] = datetime.utcnow().isoformat()
+                
+                logger.info("Fallback review generated successfully")
         except Exception as e:
             logger.error(f"Error generating fallback review: {e}")
             state["overall_summary"] = "Unable to generate review due to technical difficulties."
@@ -1260,10 +1319,10 @@ class CodeReviewWorkflow:
         return state
     
     def _format_issues_summary(self, pr_context: Dict) -> str:
-        """Format issues summary for prompts"""
-        critical = len(pr_context.get("critical_issues", []))
-        high = len(pr_context.get("high_issues", []))
-        medium = len(pr_context.get("medium_issues", []))
+        # Format issues breakdown
+        critical = len(getattr(pr_context, "critical_issues", []))
+        high = len(getattr(pr_context, "high_issues", []))
+        medium = len(getattr(pr_context, "medium_issues", []))
         
         if critical + high + medium == 0:
             return "No major issues detected by static analysis."
@@ -1272,17 +1331,18 @@ class CodeReviewWorkflow:
     
     def _format_files_summary(self, pr_context: Dict, max_files: int = 10) -> str:
         """Format files summary for prompts"""
-        files = pr_context.get("files", [])[:max_files]
+        files = getattr(pr_context, "files", [])[:max_files]
         
         summary = []
         for f in files:
             summary.append(
-                f"- **{f.get('filename')}** ({f.get('language', '?')}): "
-                f"+{f.get('additions', 0)} -{f.get('deletions', 0)}"
+                f"- **{getattr(f, 'filename', 'unknown')}** ({getattr(f, 'language', '?')}): "
+                f"+{getattr(f, 'additions', 0)} -{getattr(f, 'deletions', 0)} "
+                f"(Complexity: {getattr(f, 'complexity_score', 0)})"
             )
         
-        if len(pr_context.get("files", [])) > max_files:
-            summary.append(f"- ... and {len(pr_context.get('files', [])) - max_files} more files")
+        if len(getattr(pr_context, "files", [])) > max_files:
+            summary.append(f"- ... and {len(getattr(pr_context, 'files', [])) - max_files} more files")
         
         return "\n".join(summary)
     
@@ -1417,6 +1477,237 @@ class CodeReviewWorkflow:
         logger.info(f"[GRAPHRAG] Formatted {len(all_deps)} dependencies for review")
         return "\n".join(parts)
     
+    # ----------------------------------------------------------------
+    # M8 — Reflect / revise / LLM routing
+    # ----------------------------------------------------------------
+
+    async def _llm_route_standard(self, state: ReviewState) -> str:
+        """
+        Ask the flash model to classify a borderline PR as quick/standard/deep.
+
+        Only called when the numeric thresholds place the PR in the "standard"
+        bin.  Quick and deep edges remain fully deterministic (cost reasons).
+        Returns one of "quick" | "standard" | "deep"; defaults to "standard"
+        on any error.
+        """
+        pr_context = state.get("pr_context", {}) or {}
+        prompt = (
+            "You are deciding the review depth for a pull request.\n\n"
+            f"Title: {state.get('pr_title', '')}\n"
+            f"Files changed: {pr_context.get('total_files', '?')} files, "
+            f"+{pr_context.get('total_additions', '?')}/-{pr_context.get('total_deletions', '?')} lines\n"
+            f"Languages: {', '.join(pr_context.get('languages', []))}\n"
+            f"Description: {(state.get('pr_description') or '')[:300]}\n\n"
+            "Respond with EXACTLY one word — no punctuation, no explanation:\n"
+            "  'quick'    — documentation / config / test files only, no logic changes\n"
+            "  'deep'     — security-sensitive files (auth, payments, crypto), DB migrations, "
+            "large refactors\n"
+            "  'standard' — everything else\n"
+        )
+        try:
+            model = self.config.flash_lite_model
+            raw = await self.gemini_client.generate_review(model, prompt)
+            word = raw.strip().lower().split()[0] if raw.strip() else "standard"
+            if word in ("quick", "standard", "deep"):
+                logger.info(f"[M8] LLM routing decision: '{word}'")
+                return word
+        except Exception as e:
+            logger.warning(f"[M8] LLM routing failed ({e}), defaulting to 'standard'")
+        return "standard"
+
+    async def _reflect_node(self, state: ReviewState) -> ReviewState:
+        """
+        M8 reflection: audit the current ReviewOutput for quality problems.
+
+        Asks the flash model to evaluate each finding for:
+        - Hallucinated or irrelevant citations (verified=False)
+        - Severity mismatches (style issues flagged as critical)
+        - Generic complaints with no code evidence
+        - Missed obvious security or logic issues
+
+        Stores a CritiqueOutput dict in state["critique"].
+        Falls through gracefully if no structured_review is present.
+        """
+        logger.info(f"[REFLECT] PR #{state['pr_number']}")
+        state["current_step"] = "reflecting"
+
+        structured = state.get("structured_review")
+        if not structured:
+            logger.info("[REFLECT] No structured_review found — skipping reflection")
+            state["critique"] = CritiqueOutput(
+                overall_quality="acceptable",
+                summary="No structured review to critique.",
+            ).model_dump()
+            return state
+
+        try:
+            review_json = str(structured)[:3000]   # cap to stay inside context window
+            prompt = (
+                "You are a senior code review auditor. "
+                "Below is an AI-generated code review in JSON format.\n\n"
+                f"Review:\n{review_json}\n\n"
+                "For EACH finding, assign one action:\n"
+                "  'keep'       — accurate, well-evidenced, correct severity\n"
+                "  'strengthen' — correct finding but needs more specificity\n"
+                "  'downgrade'  — real issue but severity is too high (e.g. style as critical)\n"
+                "  'drop'       — hallucinated, false positive, or pure generic advice\n\n"
+                "Return JSON with this structure:\n"
+                '{"overall_quality": "good|acceptable|poor", '
+                '"critique_findings": [{"finding_title": "...", "action": "keep|strengthen|downgrade|drop", '
+                '"reasoning": "..."}], "summary": "one-line overall verdict"}'
+            )
+
+            model = self.config.flash_model
+            critique_obj = await self.gemini_client.generate_structured_schema(
+                model, prompt, CritiqueOutput
+            )
+            state["critique"] = critique_obj.model_dump()
+            logger.info(
+                f"[REFLECT] quality={critique_obj.overall_quality}, "
+                f"{len(critique_obj.critique_findings)} findings critiqued"
+            )
+        except Exception as e:
+            logger.error(f"[REFLECT] Error: {e}", exc_info=True)
+            state["critique"] = CritiqueOutput(
+                overall_quality="acceptable",
+                summary=f"Reflection failed: {e}",
+            ).model_dump()
+
+        return state
+
+    async def _revise_node(self, state: ReviewState) -> ReviewState:
+        """
+        M8 revision: apply the reflection critique to produce a final ReviewOutput.
+
+        For each finding:
+          'drop'      → removed
+          'downgrade' → severity lowered one level
+          'keep' / 'strengthen' → retained (strengthen adds a note to the description)
+
+        Then calls the LLM to produce a revised summary.
+        Stores the revised ReviewOutput in state["structured_review"] and re-renders
+        state["overall_summary"] as the new markdown.
+        """
+        logger.info(f"[REVISE] PR #{state['pr_number']}")
+        state["current_step"] = "revising"
+
+        structured = state.get("structured_review")
+        critique_data = state.get("critique")
+        if not structured or not critique_data:
+            logger.info("[REVISE] Missing structured_review or critique — skipping")
+            return state
+
+        try:
+            original = ReviewOutput.model_validate(structured)
+            critique = CritiqueOutput.model_validate(critique_data)
+
+            # Build a lookup: finding title → action
+            actions: Dict[str, str] = {
+                cf.finding_title.lower(): cf.action
+                for cf in critique.critique_findings
+            }
+
+            _downgrade = {"critical": "high", "high": "medium", "medium": "low", "low": "low"}
+
+            revised_findings = []
+            for f in original.findings:
+                action = actions.get(f.title.lower(), "keep")
+                if action == "drop":
+                    continue
+                if action == "downgrade":
+                    f.severity = _downgrade.get(f.severity, f.severity)
+                if action == "strengthen":
+                    f.description += " [Review auditor: consider adding more specific code evidence.]"
+                revised_findings.append(f)
+
+            revised = ReviewOutput(
+                summary=original.summary,
+                findings=revised_findings,
+                overall_assessment=original.overall_assessment,
+                risk_level=original.risk_level,
+            )
+
+            state["revised_review"] = revised.model_dump()
+            state["structured_review"] = revised.model_dump()
+            state["overall_summary"] = ReviewFormatter().format_structured_review(revised)
+
+            logger.info(
+                f"[REVISE] {len(original.findings)} findings → "
+                f"{len(revised_findings)} after critique "
+                f"(dropped {len(original.findings) - len(revised_findings)})"
+            )
+        except Exception as e:
+            logger.error(f"[REVISE] Error: {e}", exc_info=True)
+            state["errors"] = state.get("errors", []) + [
+                {"message": str(e), "step": "revise", "timestamp": datetime.utcnow().isoformat()}
+            ]
+
+        return state
+
+    # ----------------------------------------------------------------
+    # M6 — Structured review helpers
+    # ----------------------------------------------------------------
+
+    def _collect_entity_uids(self, state: ReviewState) -> set:
+        """
+        Build the set of valid graph entity UIDs from the current PR context.
+
+        UIDs are reconstructed as `{repo_id}::{file}::{name}` — the same
+        format written by GraphBuilder._batch_insert.  Only UIDs in this set
+        may be cited in graph_refs; any other UID is a hallucination.
+        """
+        pr_context = state.get("pr_context", {}) or {}
+        repo_id = pr_context.get("repo_id", "")
+        uids: set = set()
+        for file_ctx in pr_context.get("files", []):
+            # file_ctx may be a dict (serialised PRContext) or a Pydantic model
+            entities = (
+                file_ctx.entities
+                if hasattr(file_ctx, "entities")
+                else file_ctx.get("entities", [])
+            )
+            for entity in entities:
+                if hasattr(entity, "name"):
+                    name, file_path = entity.name, entity.file
+                else:
+                    name = entity.get("name", "")
+                    file_path = entity.get("file", "")
+                if name and file_path and repo_id:
+                    uids.add(f"{repo_id}::{file_path}::{name}")
+        return uids
+
+    def _format_entity_uids_block(self, state: ReviewState) -> str:
+        """
+        Render the valid entity UID list for prompt injection.
+
+        Each line is:  `{uid}  ({name} — {type} in {file})`
+        Capped at 50 entries so the prompt doesn't grow unbounded.
+        """
+        pr_context = state.get("pr_context", {}) or {}
+        repo_id = pr_context.get("repo_id", "")
+        lines: list = []
+        for file_ctx in pr_context.get("files", []):
+            entities = (
+                file_ctx.entities
+                if hasattr(file_ctx, "entities")
+                else file_ctx.get("entities", [])
+            )
+            for entity in entities:
+                if hasattr(entity, "name"):
+                    name = entity.name
+                    file_path = entity.file
+                    etype = entity.type
+                else:
+                    name = entity.get("name", "")
+                    file_path = entity.get("file", "")
+                    etype = entity.get("type", "")
+                if name and file_path and repo_id:
+                    uid = f"{repo_id}::{file_path}::{name}"
+                    lines.append(f"  {uid}  ({name} — {etype} in {file_path})")
+        if not lines:
+            return "(None available — leave graph_refs empty)"
+        return "\n".join(lines[:50])
+
     def _validate_graphrag_usage(self, review_text: str, state: Dict) -> Dict[str, any]:
         """Validate that review actually uses GraphRAG context when available"""
         merged_contexts = state.get("_merged_contexts", {})
@@ -1768,7 +2059,9 @@ class CodeReviewWorkflow:
         pr_description: Optional[str],
         files: List[Dict[str, Any]],
         base_ref: str = "main",
-        head_ref: str = "unknown"
+        head_ref: str = "unknown",
+        github_client: Optional[Any] = None,
+        installation_id: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Execute the complete review workflow
@@ -1802,7 +2095,10 @@ class CodeReviewWorkflow:
             "total_files": len(files),
             "processed_files": 0,
             "retry_count": 0,
-            "errors": []
+            "errors": [],
+            "github_client": github_client,
+            "installation_id": installation_id,
+            "parse_failure_total": 0
         }
         
         logger.info(f"Starting review workflow for PR #{pr_number} in {repo_id}")

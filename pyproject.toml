@@ -30,3 +30,13 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_functions = "test_*"
 addopts = "-v"
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["src"]
+omit = ["src/__pycache__/*", "*/migrations/*"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+skip_covered = false

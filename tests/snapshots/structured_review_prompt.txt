@@ -1,0 +1,72 @@
+## Code Review — Structured JSON Output
+
+**PR:** Add user authentication endpoint
+**Files:** 2 | +45/-3 | Risk: high
+
+### Valid GraphRAG Entity UIDs
+Cite ONLY entity UIDs from this list.  Do NOT invent UIDs.
+- test_repo::src/auth.py::authenticate_user
+- test_repo::src/auth.py::check_password
+
+### GraphRAG Context
+
+**Similar Code Patterns:**
+src/login.py:12 — similar authentication pattern
+
+**Dependencies & Impact:**
+src/database.py → src/auth.py (imports)
+
+**Key Entities & Relationships:**
+Function: authenticate_user (src/auth.py)
+
+### Static Analysis Pre-scan
+1 critical (SQL injection), 1 high (missing rate limiting)
+
+### Files Changed
+src/auth.py (+42/-3): Added authenticate_user function
+
+---
+
+<reasoning>
+Reason step-by-step before writing JSON (this block does not appear in output):
+1. Security — SQL injection? hardcoded secrets? auth bypass? XSS? insecure deserialisation?
+2. Bugs — null/undefined deref? wrong logic? off-by-one? resource leak? race condition?
+3. Performance — N+1 queries? unbounded loops? blocking I/O in async context?
+4. Quality — dead code? magic numbers? overly complex functions? missing error handling?
+5. For each finding: which entity UID from the list is GENUINELY relevant?
+   Include graph_refs only when the entity directly relates to the issue.
+   When in doubt, leave graph_refs empty — an empty list is correct.
+</reasoning>
+
+Return ONLY valid JSON — no markdown fences, no explanation text outside the object:
+
+{{
+  "summary": "One sentence PR summary",
+  "overall_assessment": "approve|request_changes|comment",
+  "risk_level": "low|medium|high|critical",
+  "findings": [
+    {{
+      "severity": "critical|high|medium|low",
+      "category": "security|bug|performance|quality|testing",
+      "title": "Short descriptive title",
+      "file": "path/to/file.py",
+      "line": 42,
+      "description": "Detailed explanation — cite the exact line and code",
+      "suggestion": "Specific fix with code example if possible",
+      "evidence": {{
+        "graph_refs": [
+          {{
+            "entity_uid": "EXACT_UID_FROM_LIST_ABOVE",
+            "entity_name": "function_name",
+            "entity_file": "path/to/file.py",
+            "relevance": "Why this entity is relevant to the finding"
+          }}
+        ],
+        "similar_code_refs": []
+      }}
+    }}
+  ]
+}}
+
+GOOD citation:  entity_uid: "repo1::src/auth.py::validate_token"  (exact match from list above)
+BAD citation:   entity_uid: "repo1::invented::fake_function"       (fabricated — NEVER do this)

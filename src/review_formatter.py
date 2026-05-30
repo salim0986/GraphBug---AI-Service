@@ -20,9 +20,14 @@ Key Features:
 - Statistics and metrics
 """
 
-from typing import Dict, List, Optional, Any
+from __future__ import annotations
+
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass
 from enum import Enum
+
+if TYPE_CHECKING:
+    from .review_schema import ReviewOutput
 
 
 # ========================================================================
@@ -351,6 +356,127 @@ class ReviewFormatter:
     # INLINE COMMENT FORMATTING
     # ====================================================================
     
+    # ----------------------------------------------------------------
+    # M6 — Structured review renderer (ReviewOutput → GFM Markdown)
+    # ----------------------------------------------------------------
+
+    def format_structured_review(self, review: "ReviewOutput") -> str:
+        """
+        Convert a ReviewOutput Pydantic model into GitHub-flavored Markdown.
+
+        Findings are grouped by severity (critical → high → medium → low).
+        Unverified findings (hallucinated graph citations) receive a warning
+        badge so reviewers can weigh them accordingly.
+        """
+        from .review_schema import ReviewOutput as _RO  # noqa: F401
+
+        _ASSESS_ICON = {
+            "approve": "✅",
+            "request_changes": "⚠️",
+            "comment": "💬",
+        }
+        _SEV_EMOJI = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+        _SEV_BADGE = {
+            "critical": "![Critical](https://img.shields.io/badge/CRITICAL-critical-critical)",
+            "high":     "![High](https://img.shields.io/badge/HIGH-high-orange)",
+            "medium":   "![Medium](https://img.shields.io/badge/MEDIUM-medium-yellow)",
+            "low":      "![Low](https://img.shields.io/badge/LOW-low-green)",
+        }
+        _SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+        parts: List[str] = []
+
+        # ── Header ──────────────────────────────────────────────────
+        icon = _ASSESS_ICON.get(review.overall_assessment, "💬")
+        parts.append("# 🤖 AI Code Review\n")
+        parts.append(f"## {icon} Overall Assessment\n\n{review.summary}\n")
+
+        # ── Statistics ──────────────────────────────────────────────
+        severity_counts: Dict[str, int] = {"critical": 0, "high": 0, "medium": 0, "low": 0}
+        for f in review.findings:
+            severity_counts[f.severity] = severity_counts.get(f.severity, 0) + 1
+
+        unverified = sum(1 for f in review.findings if not f.verified)
+        stat_rows = [
+            "| Metric | Value |",
+            "|--------|-------|",
+            f"| Risk Level | {review.risk_level.upper()} |",
+            f"| 🔴 Critical | {severity_counts['critical']} |",
+            f"| 🟠 High | {severity_counts['high']} |",
+            f"| 🟡 Medium | {severity_counts['medium']} |",
+            f"| 🟢 Low | {severity_counts['low']} |",
+        ]
+        if unverified:
+            stat_rows.append(f"| ⚠️ Unverified citations | {unverified} finding(s) |")
+        parts.append("## 📊 Review Statistics\n\n" + "\n".join(stat_rows) + "\n")
+
+        # ── Findings ────────────────────────────────────────────────
+        if not review.findings:
+            parts.append("## ✅ No Issues Found\n\nCode looks good!\n")
+        else:
+            sorted_findings = sorted(
+                review.findings,
+                key=lambda f: _SEV_ORDER.get(f.severity, 99),
+            )
+            current_sev: Optional[str] = None
+            finding_lines: List[str] = []
+
+            for finding in sorted_findings:
+                sev = finding.severity
+                if sev != current_sev:
+                    emoji = _SEV_EMOJI.get(sev, "📝")
+                    finding_lines.append(f"\n## {emoji} {sev.capitalize()} Issues\n")
+                    current_sev = sev
+
+                badge = _SEV_BADGE.get(sev, "")
+                unverified_note = (
+                    "\n> ⚠️ **Unverified** — one or more graph citations were not found "
+                    "in the GraphRAG payload and may be hallucinated. Review this finding "
+                    "independently.\n"
+                    if not finding.verified else ""
+                )
+
+                loc = (
+                    f"[`{finding.file}:{finding.line}`]({finding.file}#L{finding.line})"
+                    if finding.line else f"`{finding.file}`"
+                )
+
+                graph_evidence = ""
+                if finding.evidence.graph_refs:
+                    refs = "\n".join(
+                        f"  - `{r.entity_name}` in `{r.entity_file}` — {r.relevance}"
+                        for r in finding.evidence.graph_refs
+                    )
+                    graph_evidence = f"\n**Graph Evidence:**\n{refs}\n"
+
+                similar_evidence = ""
+                if finding.evidence.similar_code_refs:
+                    srefs = "\n".join(
+                        f"  - `{r.file}:{r.line}` (similarity: {r.similarity_score:.2f})"
+                        for r in finding.evidence.similar_code_refs
+                    )
+                    similar_evidence = f"\n**Similar Code:**\n{srefs}\n"
+
+                finding_lines.append(
+                    f"### {badge} {finding.title}\n"
+                    f"\n**Location:** {loc}"
+                    f"\n**Category:** {finding.category}"
+                    f"{unverified_note}"
+                    f"\n\n**Issue:** {finding.description}"
+                    f"\n\n**Suggestion:** {finding.suggestion}"
+                    f"{graph_evidence}"
+                    f"{similar_evidence}"
+                    "\n---\n"
+                )
+
+            parts.append("\n".join(finding_lines))
+
+        # ── Footer ──────────────────────────────────────────────────
+        parts.append(
+            "\n---\n<sub>Generated by Graph Bug AI · Structured review (M6)</sub>"
+        )
+        return "\n\n".join(parts)
+
     def format_inline_comment(self, issue: Issue) -> str:
         """
         Format issue as inline comment for specific line

@@ -1,0 +1,26 @@
+## Quick Scan: Fix authentication bug
+
+**Scope:** 1 files | +10/-2
+
+**GraphRAG:** Entities: Function: authenticate_user | Dependencies: src/database.py | Similar: src/login.py:5
+
+**Files:** src/auth.py
+**Issues:** 1 critical
+
+---
+
+## Find Problems Only
+
+Identify actual mistakes:
+🔴 Critical (security, crashes)
+🟠 High (bugs, logic errors)
+🟡 Medium (code smells)
+
+Cite line numbers (L45+). Reference GraphRAG if data provided (not "None"). No generic advice.
+
+**Output:**
+### Issues
+[List or "✅ None"]
+
+### GraphRAG Matches  
+[Cite 1-2 if available]

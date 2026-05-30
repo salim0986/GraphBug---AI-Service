@@ -3,9 +3,14 @@ Review Validator - Ensures AI reviews reference actual code
 Prevents hallucinations by checking all claims against diff
 """
 
+from __future__ import annotations
+
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Set, Tuple, Any, TYPE_CHECKING
 from .logger import setup_logger
+
+if TYPE_CHECKING:
+    from .review_schema import ReviewOutput
 
 logger = setup_logger(__name__)
 
@@ -127,6 +132,55 @@ class ReviewValidator:
         
         return is_valid, warnings, metrics
     
+    # ----------------------------------------------------------------
+    # M6 — Graph citation validation
+    # ----------------------------------------------------------------
+
+    def validate_graph_citations(
+        self,
+        review: "ReviewOutput",
+        valid_entity_uids: Set[str],
+    ) -> "ReviewOutput":
+        """
+        Structural GraphRAG citation validation (replaces `_validate_graphrag_usage`
+        substring theater from the old workflow).
+
+        For each Finding, every GraphCitation.entity_uid is checked against
+        `valid_entity_uids` — the set of UIDs actually present in the input
+        payload.  Any UID that is not in the set is a hallucination:
+
+        - `finding.verified` is set to False.
+        - `finding.severity` is downgraded one level
+          (critical→high, high→medium, medium→low, low→low).
+        - The bad UIDs are logged as warnings.
+
+        Findings with no graph_refs, or whose refs are all valid, are untouched.
+        Returns the mutated review (in-place).
+        """
+        from .review_schema import ReviewOutput  # noqa: F401 (import only for type check)
+
+        _downgrade: Dict[str, str] = {
+            "critical": "high",
+            "high": "medium",
+            "medium": "low",
+            "low": "low",
+        }
+
+        for finding in review.findings:
+            hallucinated = [
+                ref for ref in finding.evidence.graph_refs
+                if ref.entity_uid not in valid_entity_uids
+            ]
+            if hallucinated:
+                finding.verified = False
+                finding.severity = _downgrade.get(finding.severity, finding.severity)
+                logger.warning(
+                    f"[M6] Hallucinated graph citations in '{finding.title}': "
+                    + ", ".join(r.entity_uid for r in hallucinated)
+                )
+
+        return review
+
     def _extract_line_references(self, text: str) -> List[Tuple[str, int]]:
         """Extract (filename, line_number) pairs from review text"""
         refs = []

@@ -1,5 +1,8 @@
 from neo4j import GraphDatabase
 from .logger import setup_logger
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .parser import ParseReport
 
 logger = setup_logger(__name__)
 
@@ -101,6 +104,11 @@ class GraphBuilder:
             "CREATE INDEX entity_uid IF NOT EXISTS FOR (e:Entity) ON (e.uid)",
             "CREATE INDEX file_repo_id IF NOT EXISTS FOR (f:File) ON (f.repo_id)",
             "CREATE INDEX file_uid IF NOT EXISTS FOR (f:File) ON (f.uid)",
+            # M4: indexes needed for fast name-based call/inherit resolution
+            "CREATE INDEX entity_name_repo IF NOT EXISTS FOR (e:Entity) ON (e.repo_id, e.name)",
+            "CREATE INDEX entity_name_file IF NOT EXISTS FOR (e:Entity) ON (e.file, e.name)",
+            "CREATE INDEX external_uid IF NOT EXISTS FOR (e:External) ON (e.uid)",
+            "CREATE INDEX module_uid IF NOT EXISTS FOR (m:Module) ON (m.uid)",
         ]
         
         try:
@@ -222,7 +230,216 @@ class GraphBuilder:
                 logger.info(f"Created {summary.counters.relationships_created} dependency links")
         except Exception as e:
             logger.error(f"Graph dependency error: {e}")
-    
+
+    # ========================================================================
+    # M4 — AST-driven relationship edges
+    # ========================================================================
+
+    def process_relationships(self, repo_id: str, file_path: str, report) -> dict:
+        """
+        Ingest typed relationship records from a ParseReport into Neo4j.
+        Creates CALLS, IMPORTS, and INHERITS edges driven by M1 AST output.
+
+        Args:
+            repo_id:   Repository identifier.
+            file_path: Relative file path (used to locate Entity nodes by file).
+            report:    ParseReport from UniversalParser.extract_relationships().
+
+        Returns:
+            Stats dict: calls_linked, calls_external, imports_linked,
+                        inheritances_linked, inheritances_external.
+        """
+        stats = {
+            "calls_linked": 0,
+            "calls_external": 0,
+            "imports_linked": 0,
+            "inheritances_linked": 0,
+            "inheritances_external": 0,
+        }
+        file_uid = f"{repo_id}::{file_path}"
+        try:
+            if report.calls:
+                c = self._link_calls(repo_id, file_path, report.calls)
+                stats["calls_linked"] += c["calls_linked"]
+                stats["calls_external"] += c["calls_external"]
+            if report.imports:
+                stats["imports_linked"] += self._link_imports(repo_id, file_uid, report.imports)
+            if report.inheritances:
+                c = self._link_inheritances(repo_id, report.inheritances)
+                stats["inheritances_linked"] += c["inheritances_linked"]
+                stats["inheritances_external"] += c["inheritances_external"]
+        except Exception as e:
+            logger.error(f"[M4] process_relationships error for {file_path}: {e}")
+        logger.debug(
+            f"[M4] {file_path}: calls={stats['calls_linked']}+{stats['calls_external']}ext "
+            f"imports={stats['imports_linked']} inherit={stats['inheritances_linked']}+{stats['inheritances_external']}ext"
+        )
+        return stats
+
+    # Maximum rows per UNWIND statement to avoid Neo4j OOM on large files.
+    _CYPHER_BATCH = 500
+
+    def _run_batched(self, session, query: str, fixed_params: dict, batch: list) -> int:
+        """Run a Cypher query in sub-batches of _CYPHER_BATCH and sum the 'n' counter."""
+        total = 0
+        for i in range(0, len(batch), self._CYPHER_BATCH):
+            sub = batch[i : i + self._CYPHER_BATCH]
+            rec = session.run(query, **fixed_params, batch=sub).single()
+            total += rec["n"] if rec else 0
+        return total
+
+    def _link_calls(self, repo_id: str, file_path: str, calls) -> dict:
+        """
+        Batch-create CALLS edges with three prioritised passes:
+
+        Pass 1 — same-file resolution: callee defined in the same file as caller.
+                  Most precise; avoids name-collision false positives entirely.
+        Pass 2 — cross-file unambiguous resolution: callee exists in the repo,
+                  but ONLY if exactly one Entity carries that name (to prevent
+                  O(N) false edges for common identifiers like 'process', 'init').
+        Pass 3 — external stub: callee not found anywhere in this repo →
+                  create an :External node so the edge is not silently dropped.
+
+        Calls whose caller is "module_level" are excluded: no Entity node named
+        "module_level" exists in Neo4j, so they would always produce 0 matches.
+        """
+        batch = [
+            {"caller_name": c.caller, "callee_name": c.callee, "line": c.line}
+            for c in calls
+            # module_level is a synthetic sentinel, not a real Entity in the graph
+            if c.caller and c.callee and c.caller != "module_level"
+        ]
+        if not batch:
+            return {"calls_linked": 0, "calls_external": 0}
+
+        # Pass 1: same-file callee (precise, no name-collision risk)
+        q_same_file = """
+        UNWIND $batch AS c
+        MATCH (caller:Entity {repo_id: $repo_id, file: $file_path, name: c.caller_name})
+        MATCH (callee:Entity {repo_id: $repo_id, file: $file_path, name: c.callee_name})
+        WHERE caller.uid <> callee.uid
+        MERGE (caller)-[r:CALLS]->(callee)
+        ON CREATE SET r.line = c.line, r.file = $file_path
+        RETURN count(r) AS n
+        """
+
+        # Pass 2: cross-file, but only when the name is unambiguous (exactly 1 match)
+        q_cross_file = """
+        UNWIND $batch AS c
+        MATCH (caller:Entity {repo_id: $repo_id, file: $file_path, name: c.caller_name})
+        WHERE NOT EXISTS {
+            MATCH (:Entity {repo_id: $repo_id, file: $file_path, name: c.callee_name})
+        }
+        OPTIONAL MATCH (callee:Entity {repo_id: $repo_id, name: c.callee_name})
+        WHERE caller.uid <> callee.uid
+        WITH caller, c, collect(callee) AS callees
+        WHERE size(callees) = 1
+        WITH caller, c, callees[0] AS callee
+        MERGE (caller)-[r:CALLS]->(callee)
+        ON CREATE SET r.line = c.line, r.file = $file_path
+        RETURN count(r) AS n
+        """
+
+        # Pass 3: external stub for callees not found anywhere in this repo
+        q_external = """
+        UNWIND $batch AS c
+        MATCH (caller:Entity {repo_id: $repo_id, file: $file_path, name: c.caller_name})
+        WHERE NOT EXISTS {
+            MATCH (:Entity {repo_id: $repo_id, name: c.callee_name})
+        }
+        MERGE (ext:External {uid: $repo_id + '::ext::' + c.callee_name})
+        ON CREATE SET ext.name = c.callee_name, ext.repo_id = $repo_id
+        MERGE (caller)-[r:CALLS]->(ext)
+        ON CREATE SET r.line = c.line, r.file = $file_path, r.external = true
+        RETURN count(r) AS n
+        """
+
+        linked = 0
+        external = 0
+        params = {"repo_id": repo_id, "file_path": file_path}
+        try:
+            with self.driver.session() as session:
+                linked += self._run_batched(session, q_same_file, params, batch)
+                linked += self._run_batched(session, q_cross_file, params, batch)
+                external = self._run_batched(session, q_external, params, batch)
+        except Exception as e:
+            logger.error(f"[M4] _link_calls error for {file_path}: {e}")
+        return {"calls_linked": linked, "calls_external": external}
+
+    def _link_imports(self, repo_id: str, file_uid: str, imports) -> int:
+        """Create (File)-[:IMPORTS]->(Module) edges. Module nodes keyed by repo+name."""
+        batch = [
+            {"module": imp.module, "alias": imp.alias or "", "line": imp.line}
+            for imp in imports
+            if imp.module
+        ]
+        if not batch:
+            return 0
+
+        q = """
+        MATCH (f:File {uid: $file_uid})
+        UNWIND $batch AS imp
+        MERGE (m:Module {uid: $repo_id + '::mod::' + imp.module})
+        ON CREATE SET m.name = imp.module, m.repo_id = $repo_id
+        MERGE (f)-[r:IMPORTS]->(m)
+        ON CREATE SET r.line = imp.line, r.alias = imp.alias
+        RETURN count(r) AS n
+        """
+        try:
+            with self.driver.session() as session:
+                return self._run_batched(session, q, {"file_uid": file_uid, "repo_id": repo_id}, batch)
+        except Exception as e:
+            logger.error(f"[M4] _link_imports error: {e}")
+            return 0
+
+    def _link_inheritances(self, repo_id: str, inheritances) -> dict:
+        """
+        Batch-create INHERITS edges.
+        Pass 1: parent resolves to existing Entity in repo.
+        Pass 2: parent unknown — stub as :External node.
+        """
+        batch = [
+            {"child_name": inh.child, "parent_name": inh.parent, "line": inh.line}
+            for inh in inheritances
+            if inh.child and inh.parent
+        ]
+        if not batch:
+            return {"inheritances_linked": 0, "inheritances_external": 0}
+
+        q_resolved = """
+        UNWIND $batch AS inh
+        MATCH (child:Entity {repo_id: $repo_id, name: inh.child_name})
+        MATCH (parent:Entity {repo_id: $repo_id, name: inh.parent_name})
+        WHERE child.uid <> parent.uid
+        MERGE (child)-[r:INHERITS]->(parent)
+        ON CREATE SET r.line = inh.line
+        RETURN count(r) AS n
+        """
+
+        q_external = """
+        UNWIND $batch AS inh
+        MATCH (child:Entity {repo_id: $repo_id, name: inh.child_name})
+        WHERE NOT EXISTS {
+            MATCH (:Entity {repo_id: $repo_id, name: inh.parent_name})
+        }
+        MERGE (ext:External {uid: $repo_id + '::ext::' + inh.parent_name})
+        ON CREATE SET ext.name = inh.parent_name, ext.repo_id = $repo_id
+        MERGE (child)-[r:INHERITS]->(ext)
+        ON CREATE SET r.line = inh.line, r.external = true
+        RETURN count(r) AS n
+        """
+
+        linked = 0
+        external = 0
+        params = {"repo_id": repo_id}
+        try:
+            with self.driver.session() as session:
+                linked = self._run_batched(session, q_resolved, params, batch)
+                external = self._run_batched(session, q_external, params, batch)
+        except Exception as e:
+            logger.error(f"[M4] _link_inheritances error: {e}")
+        return {"inheritances_linked": linked, "inheritances_external": external}
+
     def get_dependencies(self, repo_id, file_path, start_line):
         """
         Robust Lookup: Uses File + Line Number to find the exact node 
@@ -232,8 +449,8 @@ class GraphBuilder:
         query = """
         MATCH (source:Entity {repo_id: $repo_id, file: $file_path})
         WHERE abs(source.start_line - $start_line) <= 1
-        MATCH (source)-[:MAY_CALL]->(target)
-        RETURN target.name AS name, target.file AS file, target.raw_code AS code, target.start_line AS start_line
+        MATCH (source)-[:CALLS|MAY_CALL]->(target)
+        RETURN DISTINCT target.name AS name, target.file AS file, target.raw_code AS code, target.start_line AS start_line
         LIMIT 5
         """
         try:
@@ -301,6 +518,125 @@ class GraphBuilder:
     # ADVANCED GRAPH QUERIES FOR CODE REVIEW (Phase 3.2)
     # ========================================================================
     
+    # ========================================================================
+    # M5 — Multi-hop graph queries & blast-radius analysis
+    # ========================================================================
+
+    def find_transitive_callers(
+        self,
+        repo_id: str,
+        entity_name: str,
+        max_depth: int = 4,
+    ) -> list:
+        """
+        Multi-hop backward reachability: every Entity that transitively calls
+        `entity_name`, up to `max_depth` CALLS hops away.
+
+        Results are ordered by hop-depth (direct callers first) then file.
+        Capped at 50 results to keep query time bounded on large graphs.
+        max_depth is interpolated into the query string (it is always an int
+        from internal code — no injection risk).
+        """
+        if not entity_name or max_depth < 1:
+            return []
+        query = f"""
+        MATCH path = (caller:Entity {{repo_id: $repo_id}})
+                     -[:CALLS|MAY_CALL*1..{max_depth}]->
+                     (target:Entity {{repo_id: $repo_id, name: $entity_name}})
+        RETURN DISTINCT
+            caller.name       AS name,
+            caller.file       AS file,
+            caller.type       AS type,
+            caller.start_line AS line,
+            min(length(path)) AS depth
+        ORDER BY depth, caller.file
+        LIMIT 50
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, entity_name=entity_name)
+                return [
+                    {
+                        "name": r["name"],
+                        "file": r["file"],
+                        "type": r["type"],
+                        "line": r["line"],
+                        "depth": r["depth"],
+                    }
+                    for r in result
+                ]
+        except Exception as e:
+            logger.error(f"[M5] find_transitive_callers error for {entity_name}: {e}")
+            return []
+
+    def find_blast_radius(self, repo_id: str, entity_name: str) -> dict:
+        """
+        Compute the blast radius for a changed entity.
+
+        Returns:
+          affected_functions       — transitive callers (list of dicts)
+          affected_files           — unique files containing a caller (sorted)
+          untested_callers         — callers whose file path contains no "test" marker
+          total_affected_functions — count
+          total_affected_files     — count
+        """
+        callers = self.find_transitive_callers(repo_id, entity_name, max_depth=4)
+        affected_files = sorted({c["file"] for c in callers if c.get("file")})
+        # Heuristic: a caller file is "untested" when its path does not contain
+        # "test_" or "/test/" — i.e. there is no obvious co-located test file.
+        untested = [
+            c for c in callers
+            if c.get("file") and "test" not in c["file"].lower()
+        ]
+        return {
+            "affected_functions": callers,
+            "affected_files": affected_files,
+            "untested_callers": untested,
+            "total_affected_functions": len(callers),
+            "total_affected_files": len(affected_files),
+        }
+
+    def find_cycles(
+        self,
+        repo_id: str,
+        file_path: str,
+        max_depth: int = 6,
+    ) -> list:
+        """
+        Detect CALLS-edge cycles that involve at least one function in
+        `file_path`.  Returns up to 10 unique cycles; each cycle is a list of
+        entity names in canonical form (rotated so the lexicographically
+        smallest name appears first, making [A,B,C] and [B,C,A] identical).
+        """
+        if not file_path:
+            return []
+        query = f"""
+        MATCH (start:Entity {{repo_id: $repo_id, file: $file_path}})
+        MATCH path = (start)-[:CALLS*2..{max_depth}]->(start)
+        RETURN [n IN nodes(path) | n.name] AS cycle
+        LIMIT 20
+        """
+        try:
+            with self.driver.session() as session:
+                result = session.run(query, repo_id=repo_id, file_path=file_path)
+                seen: set = set()
+                cycles: list = []
+                for r in result:
+                    raw = r["cycle"]
+                    if not raw:
+                        continue
+                    min_idx = raw.index(min(raw))
+                    canonical = tuple(raw[min_idx:] + raw[:min_idx])
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        cycles.append(list(canonical))
+                    if len(cycles) >= 10:
+                        break
+                return cycles
+        except Exception as e:
+            logger.error(f"[M5] find_cycles error for {file_path}: {e}")
+            return []
+
     def find_related_by_file(self, repo_id: str, file_path: str, limit: int = 10):
         """
         Find all entities defined in a specific file
@@ -342,8 +678,8 @@ class GraphBuilder:
         Useful for impact analysis
         """
         query = """
-        MATCH (caller:Entity {repo_id: $repo_id})-[:MAY_CALL]->(target:Entity {repo_id: $repo_id, name: $function_name})
-        RETURN caller.name AS name, caller.file AS file, caller.type AS type, 
+        MATCH (caller:Entity {repo_id: $repo_id})-[:CALLS|MAY_CALL]->(target:Entity {repo_id: $repo_id, name: $function_name})
+        RETURN DISTINCT caller.name AS name, caller.file AS file, caller.type AS type,
                caller.start_line AS line
         LIMIT $limit
         """
@@ -370,13 +706,13 @@ class GraphBuilder:
         Useful for understanding execution flow
         """
         query = """
-        MATCH path = (source:Entity {repo_id: $repo_id, name: $function_name})-[:MAY_CALL*1..$max_depth]->(target)
+        MATCH path = (source:Entity {repo_id: $repo_id, name: $function_name})-[:CALLS|MAY_CALL*1..$max_depth]->(target)
         WITH path, length(path) AS depth
         ORDER BY depth
         RETURN [node IN nodes(path) | {
-            name: node.name, 
-            type: node.type, 
-            file: node.file, 
+            name: node.name,
+            type: node.type,
+            file: node.file,
             line: node.start_line
         }] AS chain
         LIMIT 10
@@ -397,7 +733,7 @@ class GraphBuilder:
         logger.debug(f"[GraphDB] find_file_dependencies: repo_id={repo_id}, file={file_path}")
         
         query = """
-        MATCH (source:Entity {repo_id: $repo_id, file: $file_path})-[:MAY_CALL]->(target:Entity {repo_id: $repo_id})
+        MATCH (source:Entity {repo_id: $repo_id, file: $file_path})-[:CALLS|MAY_CALL]->(target:Entity {repo_id: $repo_id})
         WHERE target.file <> $file_path
         RETURN DISTINCT target.file AS file, COUNT(*) AS call_count
         ORDER BY call_count DESC

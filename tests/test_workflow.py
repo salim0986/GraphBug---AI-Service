@@ -19,7 +19,7 @@ from src.workflow import (
     CodeReviewWorkflow,
     create_review_workflow
 )
-from src.context_builder import ContextBuilder
+from src.context_builder import ContextBuilder, PRContext
 from src.gemini_client import GeminiClient
 
 
@@ -52,9 +52,9 @@ def mock_context_builder():
     mock = AsyncMock(spec=ContextBuilder)
     
     # Default PR context response
-    mock.build_pr_context.return_value = {
+    mock.build_pr_context.return_value = PRContext(**{
         "repo_id": "test-repo",
-        "pr_number": 123,
+        "title": "Test PR", "pr_number": 123,
         "total_files": 2,
         "total_additions": 50,
         "total_deletions": 10,
@@ -63,7 +63,7 @@ def mock_context_builder():
         "requires_deep_review": False,
         "files": [
             {
-                "filename": "test.py",
+                "filename": "test.py", "change_type": "modified",
                 "language": "python",
                 "additions": 30,
                 "deletions": 5,
@@ -73,7 +73,7 @@ def mock_context_builder():
                 "similar_files": []
             },
             {
-                "filename": "utils.py",
+                "filename": "utils.py", "change_type": "modified",
                 "language": "python",
                 "additions": 20,
                 "deletions": 5,
@@ -89,7 +89,7 @@ def mock_context_builder():
             {"file": "test.py", "line": 10, "description": "Complex function"}
         ],
         "recommendations": ["Consider adding tests"]
-    }
+    })
     
     return mock
 
@@ -155,13 +155,13 @@ async def test_quick_review_small_pr(workflow, mock_context_builder, mock_gemini
     
     # Create initial state
     state: ReviewState = {
-        "pr_number": 123,
+        "title": "Test PR", "pr_number": 123,
         "repo_id": "test-repo",
         "pr_title": "Fix bug in utils",
         "pr_description": "Small bug fix",
         "files": [
-            {"filename": "test.py", "additions": 30, "deletions": 5, "patch": "..."},
-            {"filename": "utils.py", "additions": 20, "deletions": 5, "patch": "..."}
+            {"filename": "test.py", "change_type": "modified", "additions": 30, "deletions": 5, "patch": "..."},
+            {"filename": "utils.py", "change_type": "modified", "additions": 20, "deletions": 5, "patch": "..."}
         ],
         "status": "pending",
         "errors": [],
@@ -170,13 +170,15 @@ async def test_quick_review_small_pr(workflow, mock_context_builder, mock_gemini
     }
     
     # Run workflow
-    graph = workflow.build()
+    workflow.compile()
+    graph = workflow.compiled
     result = await graph.ainvoke(state)
     
     # Assertions
     assert result["status"] == "completed"
     assert result["review_strategy"] == "quick"
     assert result["selected_model"] == "gemini-2.0-flash-exp"
+    print(f"\nRESULT: {result.keys()}\n")
     assert "overall_summary" in result
     assert len(result["overall_summary"]) > 0
     assert mock_context_builder.build_pr_context.called
@@ -188,11 +190,11 @@ async def test_quick_review_prioritization(workflow, mock_context_builder):
     """Test file prioritization in quick review"""
     
     state: ReviewState = {
-        "pr_number": 124,
+        "title": "Test PR", "pr_number": 124,
         "repo_id": "test-repo",
         "pr_title": "Quick fix",
         "pr_description": "Minor change",
-        "files": [{"filename": "test.py", "additions": 10, "deletions": 2, "patch": "..."}],
+        "files": [{"filename": "test.py", "change_type": "modified", "additions": 10, "deletions": 2, "patch": "..."}],
         "status": "pending",
         "errors": [],
         "messages": [],
@@ -218,9 +220,9 @@ async def test_standard_review_medium_pr(workflow, mock_context_builder, mock_ge
     """Test standard review strategy for medium PR (4-10 files, 100-500 additions)"""
     
     # Update mock to return medium PR context
-    mock_context_builder.build_pr_context.return_value = {
+    mock_context_builder.build_pr_context.return_value = PRContext(**{
         "repo_id": "test-repo",
-        "pr_number": 125,
+        "title": "Test PR", "pr_number": 125,
         "total_files": 5,
         "total_additions": 250,
         "total_deletions": 50,
@@ -229,7 +231,7 @@ async def test_standard_review_medium_pr(workflow, mock_context_builder, mock_ge
         "requires_deep_review": False,
         "files": [
             {
-                "filename": f"file{i}.py",
+                "filename": f"file{i}.py", "change_type": "modified",
                 "language": "python",
                 "additions": 50,
                 "deletions": 10,
@@ -244,15 +246,15 @@ async def test_standard_review_medium_pr(workflow, mock_context_builder, mock_ge
         "high_issues": [{"file": "file0.py", "description": "Potential bug"}],
         "medium_issues": [],
         "recommendations": ["Review error handling"]
-    }
+    })
     
     state: ReviewState = {
-        "pr_number": 125,
+        "title": "Test PR", "pr_number": 125,
         "repo_id": "test-repo",
         "pr_title": "Feature: Add new API endpoints",
         "pr_description": "Adds 5 new endpoints",
         "files": [
-            {"filename": f"file{i}.py", "additions": 50, "deletions": 10, "patch": "..."}
+            {"filename": f"file{i}.py", "change_type": "modified", "additions": 50, "deletions": 10, "patch": "..."}
             for i in range(5)
         ],
         "status": "pending",
@@ -261,7 +263,8 @@ async def test_standard_review_medium_pr(workflow, mock_context_builder, mock_ge
         "retry_count": 0
     }
     
-    graph = workflow.build()
+    workflow.compile()
+    graph = workflow.compiled
     result = await graph.ainvoke(state)
     
     assert result["status"] == "completed"
@@ -278,9 +281,9 @@ async def test_deep_review_large_pr(workflow, mock_context_builder, mock_gemini_
     """Test deep review strategy for large PR (>10 files OR >500 additions OR high risk)"""
     
     # Update mock to return large PR context
-    mock_context_builder.build_pr_context.return_value = {
+    mock_context_builder.build_pr_context.return_value = PRContext(**{
         "repo_id": "test-repo",
-        "pr_number": 126,
+        "title": "Test PR", "pr_number": 126,
         "total_files": 15,
         "total_additions": 800,
         "total_deletions": 200,
@@ -289,7 +292,7 @@ async def test_deep_review_large_pr(workflow, mock_context_builder, mock_gemini_
         "requires_deep_review": True,
         "files": [
             {
-                "filename": f"module{i}.py",
+                "filename": f"module{i}.py", "change_type": "modified",
                 "language": "python",
                 "additions": 53,
                 "deletions": 13,
@@ -314,15 +317,15 @@ async def test_deep_review_large_pr(workflow, mock_context_builder, mock_gemini_
             {"source": "module0.py", "target": "module1.py", "connections": 15}
         ],
         "recommendations": ["Security review required", "Performance testing needed"]
-    }
+    })
     
     state: ReviewState = {
-        "pr_number": 126,
+        "title": "Test PR", "pr_number": 126,
         "repo_id": "test-repo",
         "pr_title": "Major refactor: Database layer rewrite",
         "pr_description": "Complete database abstraction rewrite",
         "files": [
-            {"filename": f"module{i}.py", "additions": 53, "deletions": 13, "patch": "..."}
+            {"filename": f"module{i}.py", "change_type": "modified", "additions": 53, "deletions": 13, "patch": "..."}
             for i in range(15)
         ],
         "status": "pending",
@@ -331,12 +334,14 @@ async def test_deep_review_large_pr(workflow, mock_context_builder, mock_gemini_
         "retry_count": 0
     }
     
-    graph = workflow.build()
+    workflow.compile()
+    graph = workflow.compiled
     result = await graph.ainvoke(state)
     
     assert result["status"] == "completed"
     assert result["review_strategy"] == "deep"
     assert result["selected_model"] == "gemini-1.5-pro"  # Should use pro model
+    print(f"\nRESULT: {result.keys()}\n")
     assert "overall_summary" in result
 
 
@@ -345,9 +350,9 @@ async def test_deep_review_critical_issues(workflow, mock_context_builder):
     """Test that critical issues trigger deep review"""
     
     # PR with critical security issues
-    mock_context_builder.build_pr_context.return_value = {
+    mock_context_builder.build_pr_context.return_value = PRContext(**{
         "repo_id": "test-repo",
-        "pr_number": 127,
+        "title": "Test PR", "pr_number": 127,
         "total_files": 3,
         "total_additions": 100,
         "total_deletions": 20,
@@ -362,14 +367,14 @@ async def test_deep_review_critical_issues(workflow, mock_context_builder):
         "high_issues": [],
         "medium_issues": [],
         "recommendations": ["Security audit required"]
-    }
+    })
     
     state: ReviewState = {
-        "pr_number": 127,
+        "title": "Test PR", "pr_number": 127,
         "repo_id": "test-repo",
         "pr_title": "Update auth logic",
         "pr_description": "Changes to authentication",
-        "files": [{"filename": "auth.py", "additions": 100, "deletions": 20, "patch": "..."}],
+        "files": [{"filename": "auth.py", "change_type": "modified", "additions": 100, "deletions": 20, "patch": "..."}],
         "status": "pending",
         "errors": [],
         "messages": [],
@@ -399,11 +404,11 @@ async def test_error_handling_rate_limit(workflow, mock_gemini_client):
     ]
     
     state: ReviewState = {
-        "pr_number": 128,
+        "title": "Test PR", "pr_number": 128,
         "repo_id": "test-repo",
         "pr_title": "Test PR",
         "pr_description": "Test",
-        "files": [{"filename": "test.py", "additions": 10, "deletions": 0, "patch": "..."}],
+        "files": [{"filename": "test.py", "change_type": "modified", "additions": 10, "deletions": 0, "patch": "..."}],
         "status": "pending",
         "errors": [],
         "messages": [],
@@ -426,7 +431,7 @@ async def test_error_handling_fallback_review(workflow, mock_context_builder):
     """Test fallback review generation when Gemini fails"""
     
     state: ReviewState = {
-        "pr_number": 129,
+        "title": "Test PR", "pr_number": 129,
         "repo_id": "test-repo",
         "pr_title": "Test PR",
         "pr_description": "Test",
@@ -437,23 +442,29 @@ async def test_error_handling_fallback_review(workflow, mock_context_builder):
         ],
         "messages": [],
         "retry_count": 3,  # Max retries
-        "pr_context": {
+        "pr_context": PRContext(**{
+            "repo_id": "test",
+            "title": "Test PR", "pr_number": 129,
             "total_files": 2,
             "total_additions": 50,
             "total_deletions": 10,
+            "languages": [],
             "risk_level": "low",
+            "requires_deep_review": False,
+            "files": [],
             "critical_issues": [
                 {"file": "test.py", "line": 10, "description": "Security issue"}
             ],
             "high_issues": [],
             "medium_issues": [],
             "recommendations": ["Add tests", "Review security"]
-        }
+        })
     }
     
     # Generate fallback review
     result = await workflow._generate_fallback_review(state)
     
+    print(f"\nRESULT: {result.keys()}\n")
     assert "overall_summary" in result
     assert "automated summary" in result["overall_summary"].lower()
     assert result["status"] in ["completed_with_fallback", "failed"]
@@ -464,7 +475,7 @@ async def test_error_decision_retry(workflow):
     """Test error decision logic for retries"""
     
     state: ReviewState = {
-        "pr_number": 130,
+        "title": "Test PR", "pr_number": 130,
         "repo_id": "test-repo",
         "pr_title": "Test",
         "pr_description": "Test",
@@ -485,7 +496,7 @@ async def test_error_decision_max_retries(workflow):
     """Test error decision when max retries exceeded"""
     
     state: ReviewState = {
-        "pr_number": 131,
+        "title": "Test PR", "pr_number": 131,
         "repo_id": "test-repo",
         "pr_title": "Test",
         "pr_description": "Test",
@@ -510,11 +521,11 @@ async def test_state_transitions_quick_path(workflow, mock_context_builder, mock
     """Test complete state transitions for quick review path"""
     
     state: ReviewState = {
-        "pr_number": 132,
+        "title": "Test PR", "pr_number": 132,
         "repo_id": "test-repo",
         "pr_title": "Small fix",
         "pr_description": "Minor bug fix",
-        "files": [{"filename": "test.py", "additions": 10, "deletions": 2, "patch": "..."}],
+        "files": [{"filename": "test.py", "change_type": "modified", "additions": 10, "deletions": 2, "patch": "..."}],
         "status": "pending",
         "errors": [],
         "messages": [],
@@ -522,7 +533,8 @@ async def test_state_transitions_quick_path(workflow, mock_context_builder, mock
     }
     
     # Track state changes through workflow
-    graph = workflow.build()
+    workflow.compile()
+    graph = workflow.compiled
     result = await graph.ainvoke(state)
     
     # Verify state progression
@@ -533,6 +545,7 @@ async def test_state_transitions_quick_path(workflow, mock_context_builder, mock
     assert "pr_context" in result
     assert "review_strategy" in result
     assert "selected_model" in result
+    print(f"\nRESULT: {result.keys()}\n")
     assert "overall_summary" in result
 
 
@@ -550,9 +563,9 @@ async def test_routing_logic(workflow, mock_context_builder):
     ]
     
     for files, additions, risk, expected_strategy in test_cases:
-        mock_context_builder.build_pr_context.return_value = {
+        mock_context_builder.build_pr_context.return_value = PRContext(**{
             "repo_id": "test",
-            "pr_number": 1,
+            "title": "Test PR", "pr_number": 1,
             "total_files": files,
             "total_additions": additions,
             "total_deletions": 10,
@@ -564,14 +577,14 @@ async def test_routing_logic(workflow, mock_context_builder):
             "high_issues": [],
             "medium_issues": [],
             "recommendations": []
-        }
+        })
         
         state: ReviewState = {
-            "pr_number": 1,
+            "title": "Test PR", "pr_number": 1,
             "repo_id": "test",
             "pr_title": "Test",
             "pr_description": "Test",
-            "files": [{"filename": f"file{i}.py", "additions": 10, "deletions": 1, "patch": "..."} for i in range(files)],
+            "files": [{"filename": f"file{i}.py", "change_type": "modified", "additions": 10, "deletions": 1, "patch": "..."} for i in range(files)],
             "status": "pending",
             "errors": [],
             "messages": [],
@@ -592,11 +605,12 @@ async def test_routing_logic(workflow, mock_context_builder):
 def test_format_issues_summary(workflow):
     """Test issues summary formatting"""
     
-    pr_context = {
+    pr_context = PRContext(**{
+        "repo_id": "test", "title": "Test PR", "pr_number": 1, "total_files": 1, "total_additions": 1, "total_deletions": 1, "languages": [], "risk_level": "low", "requires_deep_review": False, "files": [], "recommendations": [],
         "critical_issues": [{"file": "test.py", "description": "Critical"}],
         "high_issues": [{"file": "test.py", "description": "High1"}, {"file": "test.py", "description": "High2"}],
         "medium_issues": []
-    }
+    })
     
     result = workflow._format_issues_summary(pr_context)
     
@@ -608,12 +622,13 @@ def test_format_issues_summary(workflow):
 def test_format_files_summary(workflow):
     """Test files summary formatting"""
     
-    pr_context = {
+    pr_context = PRContext(**{
+        "repo_id": "test", "title": "Test PR", "pr_number": 1, "total_files": 1, "total_additions": 1, "total_deletions": 1, "languages": [], "risk_level": "low", "requires_deep_review": False, "critical_issues": [], "high_issues": [], "medium_issues": [], "recommendations": [],
         "files": [
-            {"filename": "test1.py", "language": "python", "additions": 10, "deletions": 2},
-            {"filename": "test2.py", "language": "python", "additions": 20, "deletions": 5}
+            {"filename": "test1.py", "change_type": "modified", "language": "python", "additions": 10, "deletions": 2, "complexity_score": 0, "issues_summary": {}, "dependencies": [], "similar_files": []},
+            {"filename": "test2.py", "change_type": "modified", "language": "python", "additions": 20, "deletions": 5, "complexity_score": 0, "issues_summary": {}, "dependencies": [], "similar_files": []}
         ]
-    }
+    })
     
     result = workflow._format_files_summary(pr_context, max_files=10)
     
@@ -626,8 +641,8 @@ def test_find_file_context(workflow):
     """Test file context lookup"""
     
     files = [
-        {"filename": "test1.py", "additions": 10},
-        {"filename": "test2.py", "additions": 20}
+        {"filename": "test1.py", "change_type": "modified", "additions": 10},
+        {"filename": "test2.py", "change_type": "modified", "additions": 20}
     ]
     
     result = workflow._find_file_context(files, "test1.py")
@@ -669,13 +684,13 @@ async def test_full_workflow_execution(mock_context_builder, mock_gemini_client)
     )
     
     state: ReviewState = {
-        "pr_number": 999,
+        "title": "Test PR", "pr_number": 999,
         "repo_id": "integration-test",
         "pr_title": "Integration Test PR",
         "pr_description": "Full workflow test",
         "files": [
-            {"filename": "test.py", "additions": 50, "deletions": 10, "patch": "test patch"},
-            {"filename": "utils.py", "additions": 30, "deletions": 5, "patch": "utils patch"}
+            {"filename": "test.py", "change_type": "modified", "additions": 50, "deletions": 10, "patch": "test patch"},
+            {"filename": "utils.py", "change_type": "modified", "additions": 30, "deletions": 5, "patch": "utils patch"}
         ],
         "status": "pending",
         "errors": [],
@@ -683,7 +698,8 @@ async def test_full_workflow_execution(mock_context_builder, mock_gemini_client)
         "retry_count": 0
     }
     
-    graph = workflow.build()
+    workflow.compile()
+    graph = workflow.compiled
     result = await graph.ainvoke(state)
     
     # Verify complete execution
@@ -692,6 +708,7 @@ async def test_full_workflow_execution(mock_context_builder, mock_gemini_client)
     assert "pr_context" in result
     assert "review_strategy" in result
     assert "selected_model" in result
+    print(f"\nRESULT: {result.keys()}\n")
     assert "overall_summary" in result or "file_reviews" in result
     
     # Verify workflow was called in correct order

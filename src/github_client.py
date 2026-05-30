@@ -18,6 +18,7 @@ Design Decisions:
 import os
 import time
 import asyncio
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
@@ -165,6 +166,11 @@ class GitHubClient:
     def __init__(self, config: GitHubConfig):
         self.config = config
         self.token_manager = TokenManager(config)
+        # LRU cache for fetched file contents.  Keyed by "repo:ref:path".
+        # Bounded at 1 000 entries to avoid unbounded memory growth on large repos
+        # (1 000 × ~50 KB average file ≈ 50 MB worst case).
+        self._file_cache: "OrderedDict[str, str]" = OrderedDict()
+        self._file_cache_max = 1_000
         
         logger.info("GitHubClient initialized")
     
@@ -301,6 +307,86 @@ class GitHubClient:
             }
         
         return await self._retry_on_error(_fetch)
+
+    async def get_file_content(
+        self,
+        repo_full_name: str,
+        path: str,
+        ref: str,
+        installation_id: int
+    ) -> str:
+        """
+        Get raw file content from GitHub repository.
+        Caches results in memory to avoid redundant calls for the same file at the same commit.
+        
+        Args:
+            repo_full_name: Repository full name (owner/repo)
+            path: Path to the file
+            ref: Commit SHA or branch name
+            installation_id: GitHub App installation ID
+            
+        Returns:
+            str: Raw file content
+        """
+        cache_key = f"{repo_full_name}:{ref}:{path}"
+        if cache_key in self._file_cache:
+            # Move to end to mark as recently used (LRU)
+            self._file_cache.move_to_end(cache_key)
+            return self._file_cache[cache_key]
+
+        logger.info(f"Fetching file content: {repo_full_name}/{path} @ {ref}")
+
+        def _fetch():
+            github = self._get_github_instance(installation_id)
+            repo = github.get_repo(repo_full_name)
+
+            try:
+                content_file = repo.get_contents(path, ref=ref)
+                if isinstance(content_file, list):
+                    raise ValueError(f"Path '{path}' resolves to a directory, not a file.")
+
+                # Skip non-parseable content types before touching decoded_content.
+                # Symlinks and submodules look like tiny files but are not source code.
+                if getattr(content_file, "type", None) in ("symlink", "submodule"):
+                    logger.debug(f"Skipping {content_file.type}: {repo_full_name}/{path}")
+                    return ""
+
+                # GitHub API truncates files > 1 MB; warn so engineers know the
+                # AST result will be incomplete rather than silently wrong.
+                if getattr(content_file, "truncated", False):
+                    logger.warning(
+                        f"File truncated by GitHub API (> 1 MB): {repo_full_name}/{path} @ {ref}"
+                    )
+
+                raw_bytes: bytes = content_file.decoded_content
+                # Guard against binary files (images, compiled artifacts, etc.).
+                # Null bytes are a reliable indicator of non-text content.
+                if b"\x00" in raw_bytes:
+                    logger.debug(f"Skipping binary file: {repo_full_name}/{path}")
+                    return ""
+                try:
+                    return raw_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    # Non-UTF-8 text file (e.g. Latin-1 encoded legacy source).
+                    # Fall back to lossy decode so the parser still gets something.
+                    logger.warning(
+                        f"Non-UTF-8 file {repo_full_name}/{path} — decoding with errors='replace'"
+                    )
+                    return raw_bytes.decode("utf-8", errors="replace")
+
+            except GithubException as e:
+                if e.status == 404:
+                    logger.warning(f"File not found: {repo_full_name}/{path} @ {ref}")
+                    return ""
+                raise
+
+        content = await self._retry_on_error(_fetch)
+
+        # Evict oldest entry if cache is full (LRU eviction)
+        if len(self._file_cache) >= self._file_cache_max:
+            self._file_cache.popitem(last=False)
+        self._file_cache[cache_key] = content
+        return content
     
     # ====================================================================
     # PULL REQUEST OPERATIONS

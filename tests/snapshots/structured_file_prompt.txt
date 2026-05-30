@@ -1,0 +1,51 @@
+## File Review — Structured JSON Output
+
+**File:** src/auth.py
+**Language:** python
+**Changes:** +42/-3
+
+### Valid GraphRAG Entity UIDs (cite ONLY these)
+- test_repo::src/auth.py::authenticate_user
+
+### Code Diff
+```python
++ def authenticate_user(username, password):
++     query = f"SELECT * FROM users WHERE username='{username}'"
+```
+
+### GraphRAG Context
+**Similar Code:** src/login.py:5 uses parameterized queries
+**Dependencies:** src/database.py provides db handle
+**Related Entities:** Function: authenticate_user (src/auth.py)
+
+### Pre-scan Issues
+1 critical: SQL injection
+
+---
+
+<reasoning>
+Review ONLY the lines shown in the diff above. Reason before writing JSON:
+1. What security, bug, or quality issues appear in the changed lines specifically?
+2. Which entity UIDs from the list are directly relevant to each finding?
+3. Assign severity: critical=sec breach/data loss, high=definite bug, medium=smell/risk, low=style.
+</reasoning>
+
+Return ONLY valid JSON — no markdown fences:
+
+{{
+  "summary": "One line file review summary",
+  "overall_assessment": "approve|request_changes|comment",
+  "risk_level": "low|medium|high|critical",
+  "findings": [
+    {{
+      "severity": "critical|high|medium|low",
+      "category": "security|bug|performance|quality|testing",
+      "title": "Short descriptive title",
+      "file": "src/auth.py",
+      "line": 42,
+      "description": "Detailed explanation with code reference",
+      "suggestion": "Specific fix",
+      "evidence": {{ "graph_refs": [], "similar_code_refs": [] }}
+    }}
+  ]
+}}

@@ -12,6 +12,8 @@ import hashlib
 import json
 from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
+
+_BUDGET_RETENTION_DAYS = 90
 from .logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -193,20 +195,25 @@ class TokenBudget:
         self.usage: Dict[str, Dict[str, int]] = {}  # date -> {pr_id: tokens}
         
     def log_usage(self, pr_id: str, tokens: int):
-        """Log token usage for a PR"""
+        """Log token usage for a PR, evicting entries older than 90 days."""
         today = datetime.utcnow().date().isoformat()
-        
+
         if today not in self.usage:
             self.usage[today] = {}
-        
+
         self.usage[today][pr_id] = self.usage[today].get(pr_id, 0) + tokens
-        
+
         logger.info(f"Token usage: {tokens} for PR {pr_id}")
-        
+
         # Check limits
         daily_total = sum(self.usage[today].values())
         if daily_total > self.daily_limit * 0.8:
             logger.warning(f"⚠️  Approaching daily token limit: {daily_total}/{self.daily_limit}")
+
+        # Evict entries older than the retention window to cap memory growth.
+        cutoff = (datetime.utcnow() - timedelta(days=_BUDGET_RETENTION_DAYS)).date().isoformat()
+        for old_date in [d for d in list(self.usage) if d < cutoff]:
+            del self.usage[old_date]
     
     def get_daily_usage(self) -> int:
         """Get today's token usage"""

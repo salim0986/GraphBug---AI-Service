@@ -17,6 +17,16 @@ logger = setup_logger(__name__)
 # MODELS
 # ============================================================================
 
+class ImpactReport(BaseModel):
+    """Blast-radius report built from M5 multi-hop graph queries."""
+    affected_functions: List[Dict[str, Any]] = []
+    affected_files: List[str] = []
+    cycles_detected: List[List[str]] = []
+    untested_callers: List[Dict[str, Any]] = []
+    total_affected_functions: int = 0
+    total_affected_files: int = 0
+
+
 class CodeContext(BaseModel):
     """Context for a single code entity"""
     name: str
@@ -59,7 +69,8 @@ class PRContext(BaseModel):
     files: List[FileContext]
     
     # Impact analysis
-    affected_callers: int = 0
+    affected_callers: int = 0          # kept for backward compat; prefer `impact`
+    impact: Optional[ImpactReport] = None
     complexity_hotspots: List[Dict[str, Any]] = []
     high_coupling_files: List[Dict[str, Any]] = []
     
@@ -180,7 +191,17 @@ class ContextBuilder:
             high_issues=high_issues
         )
         
-        # 7. Build PR context
+        # 7. M5: multi-hop impact analysis
+        changed_file_paths = [f.filename for f in files]
+        try:
+            impact_report = self._build_impact_report(repo_id, changed_file_paths)
+        except Exception as e:
+            logger.warning(f"[M5] Impact report failed (non-fatal): {e}")
+            impact_report = ImpactReport()
+
+        # 8. Build PR context
+        static_affected = pr_analysis.overall_metrics.get("total_affected_callers", 0)
+        graph_affected = impact_report.total_affected_functions
         pr_context = PRContext(
             pr_number=pr_number,
             repo_id=repo_id,
@@ -191,7 +212,8 @@ class ContextBuilder:
             total_deletions=sum(f.deletions for f in files),
             languages=languages,
             files=file_contexts,
-            affected_callers=pr_analysis.overall_metrics.get("total_affected_callers", 0),
+            affected_callers=graph_affected or static_affected,
+            impact=impact_report,
             complexity_hotspots=pr_analysis.overall_metrics.get("complexity_hotspots", []),
             high_coupling_files=pr_analysis.overall_metrics.get("high_coupling_files", []),
             critical_issues=critical_issues,
@@ -301,6 +323,76 @@ class ContextBuilder:
             complexity_score=min(complexity_score, 100)  # Cap at 100
         )
     
+    def _build_impact_report(
+        self,
+        repo_id: str,
+        changed_files: List[str],
+    ) -> ImpactReport:
+        """
+        Build a merged ImpactReport for all files changed in the PR.
+
+        For each changed file:
+          - Run find_cycles to detect call-graph cycles.
+          - Fetch up to 10 entities defined in the file.
+          - For each entity, call find_blast_radius (capped at 5 per file to
+            keep query count reasonable).
+        Results are deduplicated by (file, name) across all entities.
+        Changed files are excluded from affected_files (they are already in scope).
+        """
+        all_functions: Dict[str, Dict] = {}
+        all_files: set = set()
+        all_cycles: List[List[str]] = []
+        seen_cycles: set = set()
+        untested_set: Dict[str, Dict] = {}
+
+        for file_path in changed_files[:10]:  # cap at 10 files
+            try:
+                cycles = self.graph_db.find_cycles(repo_id, file_path)
+                for c in cycles:
+                    key = tuple(c)
+                    if key not in seen_cycles:
+                        seen_cycles.add(key)
+                        all_cycles.append(c)
+            except Exception as exc:
+                logger.warning(f"[M5] find_cycles failed for {file_path}: {exc}")
+
+            try:
+                entities = self.graph_db.find_related_by_file(repo_id, file_path, limit=10)
+            except Exception as exc:
+                logger.warning(f"[M5] find_related_by_file failed for {file_path}: {exc}")
+                entities = []
+
+            for entity in entities[:5]:  # cap at 5 entities per file
+                name = entity.get("name", "")
+                if not name:
+                    continue
+                try:
+                    blast = self.graph_db.find_blast_radius(repo_id, name)
+                    for func in blast["affected_functions"]:
+                        uid = f"{func.get('file', '')}::{func.get('name', '')}"
+                        if uid not in all_functions:
+                            all_functions[uid] = func
+                    all_files.update(blast["affected_files"])
+                    for uc in blast["untested_callers"]:
+                        uid = f"{uc.get('file', '')}::{uc.get('name', '')}"
+                        if uid not in untested_set:
+                            untested_set[uid] = uc
+                except Exception as exc:
+                    logger.warning(f"[M5] find_blast_radius failed for {name}: {exc}")
+
+        changed_set = set(changed_files)
+        affected_files = sorted(all_files - changed_set)
+        affected_functions = list(all_functions.values())
+
+        return ImpactReport(
+            affected_functions=affected_functions,
+            affected_files=affected_files,
+            cycles_detected=all_cycles,
+            untested_callers=list(untested_set.values()),
+            total_affected_functions=len(affected_functions),
+            total_affected_files=len(affected_files),
+        )
+
     def _find_file_change(self, files: List[FileChange], filename: str) -> Optional[FileChange]:
         """Find FileChange object for a filename"""
         for f in files:
@@ -423,11 +515,29 @@ class ContextBuilder:
             ""
         ]
         
+        if pr_context.impact and pr_context.impact.total_affected_functions:
+            imp = pr_context.impact
+            summary_lines.append(
+                f"💥 Blast radius: {imp.total_affected_functions} function(s) "
+                f"across {imp.total_affected_files} file(s) transitively affected"
+            )
+            if imp.cycles_detected:
+                summary_lines.append(
+                    f"🔄 Cycles detected: {len(imp.cycles_detected)} call-graph cycle(s) "
+                    "involving changed files"
+                )
+            if imp.untested_callers:
+                summary_lines.append(
+                    f"⚠️  Untested callers: {len(imp.untested_callers)} caller(s) with no "
+                    "apparent test coverage"
+                )
+            summary_lines.append("")
+
         if pr_context.recommendations:
             summary_lines.append("📝 Recommendations:")
             for rec in pr_context.recommendations:
                 summary_lines.append(f"  • {rec}")
-        
+
         return "\n".join(summary_lines)
     
     # ============================================================================

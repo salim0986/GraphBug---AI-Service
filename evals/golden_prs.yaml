@@ -1,0 +1,429 @@
+# M9 — Golden PR dataset for RAG evaluation
+#
+# Starter set: 10 hand-labelled PRs covering the most important finding
+# categories.  Each entry is intentionally self-contained (no live DB needed)
+# so the eval harness can run in offline mode for CI.
+#
+# Expand this file toward the target of ~50 entries by adding real PRs from
+# your repositories once the eval infrastructure is in place.
+#
+# Schema:
+#   id:               unique identifier (used in CSV output)
+#   title:            PR title
+#   description:      PR body (can be empty)
+#   files[]:
+#     filename:       relative file path
+#     patch:          unified diff (+ lines are additions, - are removals)
+#   expected_findings[]:
+#     file:           filename suffix that must appear in the finding
+#     line:           expected line number (matched with ±5 tolerance)
+#     category:       security | bug | performance | quality | testing
+#     severity:       critical | high | medium | low
+#     must_mention:   list of keywords that must appear in the description
+#   graphrag_context:
+#     entities[]:     graph entities available for citation
+#     similar_code[]: vector-search results
+
+prs:
+
+  # ── PR-001: SQL injection ─────────────────────────────────────────────────
+  - id: pr-001
+    title: "Add user search endpoint"
+    description: "Adds a /users/search route that queries by username."
+    files:
+      - filename: src/routes/users.py
+        patch: |
+          @@ -0,0 +1,12 @@
+          +from flask import request, g
+          +
+          +@app.route("/users/search")
+          +def search_users():
+          +    username = request.args.get("username", "")
+          +    query = f"SELECT * FROM users WHERE username = '{username}'"
+          +    results = g.db.execute(query).fetchall()
+          +    return jsonify([dict(r) for r in results])
+    expected_findings:
+      - file: users.py
+        line: 6
+        category: security
+        severity: critical
+        must_mention:
+          - sql injection
+    graphrag_context:
+      entities:
+        - name: search_users
+          file: src/routes/users.py
+          type: function
+          code: |
+            def search_users():
+                username = request.args.get("username", "")
+                query = f"SELECT * FROM users WHERE username = '{username}'"
+                results = g.db.execute(query).fetchall()
+                return jsonify([dict(r) for r in results])
+      similar_code:
+        - file: src/routes/products.py
+          line: 34
+          snippet: |
+            query = "SELECT * FROM products WHERE name = ?"
+            db.execute(query, [name])
+
+  # ── PR-002: Hardcoded credentials ─────────────────────────────────────────
+  - id: pr-002
+    title: "Add payment gateway integration"
+    description: "Integrates Stripe for subscription billing."
+    files:
+      - filename: src/payments/stripe_client.py
+        patch: |
+          @@ -0,0 +1,8 @@
+          +import stripe
+          +
+          +STRIPE_SECRET_KEY = "REDACTED_STRIPE_KEY"
+          +STRIPE_WEBHOOK_SECRET = "whsec_test_abc123"
+          +
+          +stripe.api_key = STRIPE_SECRET_KEY
+          +
+          +def charge_customer(amount, token):
+    expected_findings:
+      - file: stripe_client.py
+        line: 3
+        category: security
+        severity: critical
+        must_mention:
+          - hardcoded
+    graphrag_context:
+      entities:
+        - name: charge_customer
+          file: src/payments/stripe_client.py
+          type: function
+          code: "def charge_customer(amount, token): ..."
+      similar_code: []
+
+  # ── PR-003: Missing error handling around DB call ─────────────────────────
+  - id: pr-003
+    title: "Persist user preferences to database"
+    description: "Saves theme and notification settings."
+    files:
+      - filename: src/services/preferences.py
+        patch: |
+          @@ -10,6 +10,10 @@
+           def save_preferences(user_id, prefs):
+          +    db.execute(
+          +        "INSERT INTO preferences (user_id, data) VALUES (?, ?)",
+          +        [user_id, json.dumps(prefs)]
+          +    )
+          +    db.commit()
+    expected_findings:
+      - file: preferences.py
+        line: 13
+        category: bug
+        severity: high
+        must_mention:
+          - exception
+    graphrag_context:
+      entities:
+        - name: save_preferences
+          file: src/services/preferences.py
+          type: function
+          code: |
+            def save_preferences(user_id, prefs):
+                db.execute("INSERT INTO preferences ...", [user_id, json.dumps(prefs)])
+                db.commit()
+      similar_code:
+        - file: src/services/sessions.py
+          line: 22
+          snippet: |
+            try:
+                db.execute(...)
+                db.commit()
+            except sqlite3.Error as e:
+                db.rollback()
+                raise
+
+  # ── PR-004: N+1 query in a loop ────────────────────────────────────────────
+  - id: pr-004
+    title: "Display order history with product names"
+    description: "Renders the order history page with full product details."
+    files:
+      - filename: src/views/orders.py
+        patch: |
+          @@ -5,8 +5,14 @@
+           def order_history(user_id):
+               orders = db.query("SELECT * FROM orders WHERE user_id=?", [user_id])
+          +    result = []
+          +    for order in orders:
+          +        product = db.query(
+          +            "SELECT * FROM products WHERE id=?", [order["product_id"]]
+          +        ).first()
+          +        result.append({**order, "product": product})
+          +    return result
+    expected_findings:
+      - file: orders.py
+        line: 9
+        category: performance
+        severity: medium
+        must_mention:
+          - n+1
+    graphrag_context:
+      entities:
+        - name: order_history
+          file: src/views/orders.py
+          type: function
+          code: |
+            def order_history(user_id):
+                orders = db.query("SELECT * FROM orders WHERE user_id=?", [user_id])
+                for order in orders:
+                    product = db.query("SELECT * FROM products WHERE id=?", [order["product_id"]]).first()
+      similar_code:
+        - file: src/views/cart.py
+          line: 18
+          snippet: |
+            product_ids = [i.product_id for i in items]
+            products = db.query("SELECT * FROM products WHERE id IN (?)", [product_ids])
+
+  # ── PR-005: File resource leak ─────────────────────────────────────────────
+  - id: pr-005
+    title: "Export audit log to CSV"
+    description: "Dumps the audit log table to a downloadable CSV file."
+    files:
+      - filename: src/admin/export.py
+        patch: |
+          @@ -0,0 +1,10 @@
+          +import csv
+          +
+          +def export_audit_log(output_path):
+          +    f = open(output_path, "w", newline="")
+          +    writer = csv.writer(f)
+          +    rows = db.query("SELECT * FROM audit_log ORDER BY created_at")
+          +    for row in rows:
+          +        writer.writerow(row)
+          +    # BUG: file never closed on exception
+    expected_findings:
+      - file: export.py
+        line: 4
+        category: bug
+        severity: high
+        must_mention:
+          - resource leak
+    graphrag_context:
+      entities:
+        - name: export_audit_log
+          file: src/admin/export.py
+          type: function
+          code: |
+            def export_audit_log(output_path):
+                f = open(output_path, "w", newline="")
+                writer = csv.writer(f)
+                for row in rows:
+                    writer.writerow(row)
+      similar_code:
+        - file: src/admin/reports.py
+          line: 12
+          snippet: |
+            with open(output_path, "w") as f:
+                writer = csv.writer(f)
+                for row in rows:
+                    writer.writerow(row)
+
+  # ── PR-006: Insecure random for token generation ───────────────────────────
+  - id: pr-006
+    title: "Add password reset token endpoint"
+    description: "Generates a one-time token for password resets."
+    files:
+      - filename: src/auth/reset.py
+        patch: |
+          @@ -0,0 +1,8 @@
+          +import random
+          +import string
+          +
+          +def generate_reset_token():
+          +    chars = string.ascii_letters + string.digits
+          +    token = "".join(random.choice(chars) for _ in range(32))
+          +    return token
+    expected_findings:
+      - file: reset.py
+        line: 6
+        category: security
+        severity: high
+        must_mention:
+          - secrets
+    graphrag_context:
+      entities:
+        - name: generate_reset_token
+          file: src/auth/reset.py
+          type: function
+          code: |
+            def generate_reset_token():
+                chars = string.ascii_letters + string.digits
+                token = "".join(random.choice(chars) for _ in range(32))
+                return token
+      similar_code:
+        - file: src/auth/otp.py
+          line: 5
+          snippet: |
+            import secrets
+            token = secrets.token_urlsafe(32)
+
+  # ── PR-007: Race condition on shared counter ───────────────────────────────
+  - id: pr-007
+    title: "Add rate limiting via in-memory counter"
+    description: "Limits API calls per user using a shared dict."
+    files:
+      - filename: src/middleware/rate_limit.py
+        patch: |
+          @@ -0,0 +1,12 @@
+          +_counters = {}
+          +
+          +def check_rate_limit(user_id, limit=100):
+          +    count = _counters.get(user_id, 0)
+          +    if count >= limit:
+          +        return False
+          +    _counters[user_id] = count + 1
+          +    return True
+    expected_findings:
+      - file: rate_limit.py
+        line: 4
+        category: bug
+        severity: high
+        must_mention:
+          - race condition
+    graphrag_context:
+      entities:
+        - name: check_rate_limit
+          file: src/middleware/rate_limit.py
+          type: function
+          code: |
+            _counters = {}
+            def check_rate_limit(user_id, limit=100):
+                count = _counters.get(user_id, 0)
+                _counters[user_id] = count + 1
+      similar_code:
+        - file: src/middleware/throttle.py
+          line: 8
+          snippet: |
+            with _lock:
+                count = _counters.get(user_id, 0)
+                _counters[user_id] = count + 1
+
+  # ── PR-008: Empty except swallowing exceptions ─────────────────────────────
+  - id: pr-008
+    title: "Retry failed webhook deliveries"
+    description: "Adds a background job that retries failed webhook sends."
+    files:
+      - filename: src/jobs/webhook_retry.py
+        patch: |
+          @@ -0,0 +1,12 @@
+          +import requests
+          +
+          +def retry_webhook(url, payload, max_attempts=3):
+          +    for attempt in range(max_attempts):
+          +        try:
+          +            resp = requests.post(url, json=payload, timeout=5)
+          +            if resp.status_code == 200:
+          +                return True
+          +        except:
+          +            pass
+          +    return False
+    expected_findings:
+      - file: webhook_retry.py
+        line: 9
+        category: bug
+        severity: medium
+        must_mention:
+          - except
+    graphrag_context:
+      entities:
+        - name: retry_webhook
+          file: src/jobs/webhook_retry.py
+          type: function
+          code: |
+            def retry_webhook(url, payload, max_attempts=3):
+                for attempt in range(max_attempts):
+                    try:
+                        resp = requests.post(url, json=payload, timeout=5)
+                        if resp.status_code == 200:
+                            return True
+                    except:
+                        pass
+      similar_code: []
+
+  # ── PR-009: Dead code after return ─────────────────────────────────────────
+  - id: pr-009
+    title: "Refactor permission checker"
+    description: "Consolidates admin vs user permission logic."
+    files:
+      - filename: src/auth/permissions.py
+        patch: |
+          @@ -5,10 +5,14 @@
+           def check_permission(user, action):
+               if user.is_admin:
+                   return True
+          +    return False
+          +    # Dead code below — never reached
+          +    if user.role in ALLOWED_ROLES.get(action, []):
+          +        return True
+    expected_findings:
+      - file: permissions.py
+        line: 9
+        category: quality
+        severity: low
+        must_mention:
+          - unreachable
+    graphrag_context:
+      entities:
+        - name: check_permission
+          file: src/auth/permissions.py
+          type: function
+          code: |
+            def check_permission(user, action):
+                if user.is_admin:
+                    return True
+                return False
+                if user.role in ALLOWED_ROLES.get(action, []):
+                    return True
+      similar_code: []
+
+  # ── PR-010: Missing input validation ──────────────────────────────────────
+  - id: pr-010
+    title: "Add file upload endpoint"
+    description: "Allows users to upload profile pictures."
+    files:
+      - filename: src/routes/upload.py
+        patch: |
+          @@ -0,0 +1,14 @@
+          +import os
+          +from flask import request
+          +
+          +UPLOAD_DIR = "/var/app/uploads"
+          +
+          +@app.route("/upload", methods=["POST"])
+          +def upload_file():
+          +    f = request.files["file"]
+          +    filename = f.filename
+          +    dest = os.path.join(UPLOAD_DIR, filename)
+          +    f.save(dest)
+          +    return {"path": dest}
+    expected_findings:
+      - file: upload.py
+        line: 9
+        category: security
+        severity: critical
+        must_mention:
+          - path traversal
+    graphrag_context:
+      entities:
+        - name: upload_file
+          file: src/routes/upload.py
+          type: function
+          code: |
+            def upload_file():
+                f = request.files["file"]
+                filename = f.filename
+                dest = os.path.join(UPLOAD_DIR, filename)
+                f.save(dest)
+      similar_code:
+        - file: src/routes/attachments.py
+          line: 15
+          snippet: |
+            from werkzeug.utils import secure_filename
+            filename = secure_filename(f.filename)
+            dest = os.path.join(UPLOAD_DIR, filename)
