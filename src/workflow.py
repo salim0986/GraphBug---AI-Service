@@ -241,7 +241,7 @@ class CodeReviewWorkflow:
         """Lazy load embedding model for temporary vectors"""
         if self._embed_model is None:
             logger.info("[TempGraphRAG] Loading sentence-transformers model...")
-            self._embed_model = SentenceTransformer('jina-embeddings-v2-base-code', trust_remote_code=True)
+            self._embed_model = SentenceTransformer('all-MiniLM-L6-v2')
         return self._embed_model
     
     async def _build_temporary_graphrag(
